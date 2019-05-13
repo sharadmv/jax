@@ -448,8 +448,11 @@ def svd_impl(operand, full_matrices, compute_uv):
   return core.pack((s, u, vt))
 
 def svd_translation_rule(c, operand, full_matrices, compute_uv):
-  raise NotImplementedError(
-    "Singular value decomposition is only implemented on the CPU backend")
+  if not full_matrices:
+    # this case isn't handled by XLA yet, but there is a todo inplace
+    raise NotImplementedError(
+        "Singular value decomposition with full matrices=False is only implemented on the CPU backend")
+  return c.SVD(operand)
 
 def svd_abstract_eval(operand, full_matrices, compute_uv):
   if isinstance(operand, ShapedArray):

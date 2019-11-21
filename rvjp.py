@@ -27,6 +27,7 @@ def trace_to_jaxpr(f, *args, **kwargs):
   out_avals, _ = unzip2(out_pvals)
   return core.TypedJaxpr(jaxpr, consts, in_avals, out_avals)
 
+
 class Unknown(object):
   def __repr__(self): return '?'
 unknown = Unknown()
@@ -47,6 +48,8 @@ def rvjp(typed_jaxpr, out_primals, out_cotangents):
       return result
 
   def delete(v):
+    if type(v) is core.Literal:
+      return
     primal_env[v] = deleted
     ct_env[v] = deleted
 
@@ -61,14 +64,16 @@ def rvjp(typed_jaxpr, out_primals, out_cotangents):
       delete(v)
 
   def write_primal(v, val):
-    assert val is not deleted
-    if val is not unknown:
-      primal_env[v] = val
+    if type(v) is not core.Literal:
+      assert val is not deleted
+      if val is not unknown:
+        primal_env[v] = val
 
   def write_cotangent(v, ct):
-    assert ct is not deleted
-    if ct is not None:
-      ct_env[v] = ad.add_tangents(ct_env[v], ct) if v in ct_env else ct
+    if type(v) is not core.Literal:
+      assert ct is not deleted
+      if ct is not None:
+        ct_env[v] = ad.add_tangents(ct_env[v], ct) if v in ct_env else ct
 
   def read_cotangent(v):
     result = ct_env.get(v, ad.zero)
@@ -181,7 +186,7 @@ inverses[lax.exp_p] = exp_inverse
 import jax.numpy as np
 
 def f(x, y):
-  return np.exp(x), x + y
+  return x + 1., x + y
 print(f(2., 3.))
 
 jaxpr = trace_to_jaxpr(f, 2., 3.)
@@ -201,6 +206,10 @@ print(f_vjp((1., 1.)))
 
 
 def g(x, y):
+  x, y = f(x, y)
+  x, y = f(x, y)
+  x, y = f(x, y)
+  x, y = f(x, y)
   x, y = f(x, y)
   x, y = f(x, y)
   return x, y

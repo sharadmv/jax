@@ -37,7 +37,8 @@ from jax import tree_util
 from jax._src.config import config
 from jax.core import (Primitive, _canonicalize_dimension, UnshapedArray,
                       ShapedArray, ConcreteArray, raise_to_shaped,
-                      abstract_token, canonicalize_shape)
+                      abstract_token, canonicalize_shape,
+                      _convert_element_type)
 from jax._src.abstract_arrays import array_types
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
@@ -427,36 +428,6 @@ def convert_element_type(operand: Array, new_dtype: DType) -> Array:
   if hasattr(operand, '__jax_array__'):
     operand = operand.__jax_array__()
   return _convert_element_type(operand, new_dtype, weak_type=False)
-
-def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
-                          weak_type: bool = False):
-  # Don't canonicalize old_dtype because x64 context might cause
-  # un-canonicalized operands to be passed in.
-  old_dtype = np.result_type(operand)
-  old_weak_type = dtypes.is_weakly_typed(operand)
-
-  new_dtype = dtypes.canonicalize_dtype(new_dtype or old_dtype)
-  new_weak_type = bool(weak_type)
-
-  if (dtypes.issubdtype(old_dtype, np.complexfloating) and
-      not dtypes.issubdtype(new_dtype, np.complexfloating)):
-    msg = "Casting complex values to real discards the imaginary part"
-    warnings.warn(msg, np.ComplexWarning, stacklevel=2)
-
-  # Python has big integers, but convert_element_type(2 ** 100, np.float32) need
-  # not be an error since the target dtype fits the value. Handle this case by
-  # converting to a NumPy array before calling bind. Without this step, we'd
-  # first canonicalize the input to a value of dtype int32 or int64, leading to
-  # an overflow error.
-  if type(operand) is int:
-    operand = np.asarray(operand, new_dtype)
-
-  if ((old_dtype, old_weak_type) == (new_dtype, new_weak_type)
-      and isinstance(operand, (core.Tracer, xla.DeviceArray))):
-    return operand
-  else:
-    return convert_element_type_p.bind(operand, new_dtype=new_dtype,
-                                       weak_type=new_weak_type)
 
 def bitcast_convert_type(operand: Array, new_dtype: DType) -> Array:
   """Elementwise bitcast.
@@ -2112,7 +2083,7 @@ ad_util.jaxval_zeros_likers[pxla.ShardedDeviceArray] = zeros_like_array
 ### primitives
 
 
-_input_dtype = lambda *args, **_: dtypes.canonicalize_dtype(args[0].dtype)
+_input_dtype = lambda *args, **_: dtypes.make_array_dtype(args[0].dtype)
 _fixed_dtype = lambda dtype: lambda *args, **kwargs: dtypes.canonicalize_dtype(dtype)
 _complex_basetype = lambda dtype: np.abs(np.zeros((), dtype)).dtype
 

@@ -164,6 +164,20 @@ class X64ContextTests(jtu.JaxTestCase):
     out = f(1)
     self.assertEqual(out.dtype, jnp.int64)
 
+  def test_scan_with_contextmanager(self):
+    def f(a):
+      def body(carry, _):
+        with enable_x64():
+          y = (carry + a).astype(jnp.int64)
+          assert y.dtype == jnp.int64
+          z = y.astype(jnp.int32)
+        return carry, (z, y)
+      return lax.scan(body, 2, jnp.arange(4))
+    carry_out, ys_out = f(3)
+    self.assertEqual(carry_out.dtype, jnp.int32)
+    self.assertEqual(ys_out[0].dtype, jnp.int32)
+    self.assertEqual(ys_out[1].dtype, jnp.int64)
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

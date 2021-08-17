@@ -32,6 +32,7 @@ from jax._src import dtypes
 from .. import linear_util as lu
 from jax._src import source_info_util
 from jax._src.abstract_arrays import (make_shaped_array, array_types)
+from jax._src.config import enable_x64
 from ..core import (ConcreteArray, ShapedArray, AbstractToken,
                     Literal, pp_eqn_compact, raise_to_shaped, abstract_token)
 from ..errors import UnexpectedTracerError
@@ -1055,7 +1056,8 @@ def _array_aval_from_xla_shape(xla_shape):
 
 def lower_fun_initial_style(fun):
   def f(c, axis_env, name_stack, avals, backend, *xla_args, **params):
-    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(fun, params), avals)
+    with enable_x64(True):
+      jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(fun, params), avals)
     outs = jaxpr_subcomp(c, jaxpr, backend, axis_env, _xla_consts(c, consts),
                          name_stack, *xla_args)
     return xops.Tuple(c, outs)

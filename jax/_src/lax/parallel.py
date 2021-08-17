@@ -786,6 +786,7 @@ def _ppermute_batcher(frame, vals_in, dims_in, axis_name, perm):
   perm_indices = [None] * frame.size
   for src, dst in perm:
     perm_indices[src] = dst
+  perm_indices = lax_numpy.array(perm_indices, lax_numpy.int32)
   return lax_numpy.take(v, perm_indices, d), d
 
 def _collective_batcher(prim, args, dims, **params):

@@ -23,6 +23,7 @@ from jax import linear_util as lu
 from jax.tree_util import (tree_flatten, tree_unflatten, tree_map,
                         tree_multimap, treedef_is_leaf, treedef_tuple,
                         register_pytree_node_class)
+from jax._src.config import enable_x64
 from jax._src.util import cache, safe_zip, safe_map, split_list
 from jax.api_util import flatten_fun_nokwargs, argnums_partial, wrap_hashably
 from jax.core import raise_to_shaped
@@ -316,7 +317,8 @@ def _custom_jvp_call_jaxpr_jvp(
   consts_dot, args_dot = split_list(tangents, [num_consts])
   if any(type(t) is not Zero for t in consts_dot):
     raise ad.CustomJVPException()
-  jvp_jaxpr, jvp_consts = jvp_jaxpr_thunk()  # consts can be tracers!
+  with enable_x64(False):
+    jvp_jaxpr, jvp_consts = jvp_jaxpr_thunk()  # consts can be tracers!
   args_dot = map(ad.instantiate_zeros, args_dot)
   # Cast float0 to zeros with the primal dtype because custom jvp rules don't
   # currently handle float0s
@@ -344,7 +346,8 @@ def _custom_jvp_call_jaxpr_vmap(
 
   @pe._memoize
   def batched_jvp_jaxpr_thunk():
-    jvp_jaxpr = core.ClosedJaxpr(*jvp_jaxpr_thunk())  # consts can be tracers
+    with enable_x64(False):
+      jvp_jaxpr = core.ClosedJaxpr(*jvp_jaxpr_thunk())  # consts can be tracers
     _, args_batched = split_list(in_batched, [num_consts])
     _, all_batched = batching.batch_jaxpr(jvp_jaxpr, size, args_batched * 2, False,
                                           axis_name, main_type)
@@ -602,7 +605,8 @@ def _custom_vjp_call_jaxpr_jvp(
   consts_dot, args_dot = split_list(tangents, [num_consts])
   if any(type(t) is not Zero for t in consts_dot):
     raise ad.CustomVJPException()
-  fwd_jaxpr, fwd_consts = fwd_jaxpr_thunk()  # consts can be tracers!
+  with enable_x64(False):
+    fwd_jaxpr, fwd_consts = fwd_jaxpr_thunk()  # consts can be tracers!
   out_tree, res_tree = out_trees()
   args_dot = map(ad.instantiate_zeros, args_dot)
   # Cast float0 to zeros with the primal dtype because custom vjp rules don't
@@ -634,7 +638,8 @@ def _custom_vjp_call_jaxpr_vmap(
 
   @pe._memoize
   def batched_fwd_jaxpr_thunk():
-    fwd_jaxpr = core.ClosedJaxpr(*fwd_jaxpr_thunk())  # consts can be tracers
+    with enable_x64(False):
+      fwd_jaxpr = core.ClosedJaxpr(*fwd_jaxpr_thunk())  # consts can be tracers
     batched_fwd_jaxpr, out_batched = batching.batch_jaxpr(
         fwd_jaxpr, axis_size, args_batched, False, axis_name, main_type)
     out_dims2.append([0 if b else not_mapped for b in out_batched])

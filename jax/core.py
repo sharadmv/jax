@@ -20,6 +20,7 @@ from collections import namedtuple
 from functools import total_ordering
 import gc
 import itertools as it
+import warnings
 from weakref import ref
 import threading
 import types
@@ -31,7 +32,7 @@ import numpy as np
 
 from ._src import dtypes
 from ._src import config as jax_config
-from ._src.config import FLAGS, config
+from ._src.config import FLAGS, config, enable_x64
 from .errors import (ConcretizationTypeError, TracerArrayConversionError,
                      TracerIntegerConversionError, UnexpectedTracerError)
 from . import linear_util as lu
@@ -45,6 +46,8 @@ from ._src.pprint_util import pp, vcat, PrettyPrint
 from ._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
+Array = Any
+DType = Any
 zip = safe_zip
 map = safe_map
 
@@ -333,18 +336,72 @@ def eval_jaxpr_eqn(eqn, in_vals):
     return eqn.primitive.bind(*(subfuns + in_vals), **bind_params)
 
 
+def _check_aval_type(val, aval):
+  if aval is abstract_token or aval is abstract_unit:
+    return
+  assert val.dtype == aval.dtype, (val.dtype, aval.dtype)
+
+
+def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
+                          weak_type: bool = False):
+  # Don't canonicalize old_dtype because x64 context might cause
+  # un-canonicalized operands to be passed in.
+  old_dtype = np.result_type(operand)
+  old_weak_type = dtypes.is_weakly_typed(operand)
+
+  new_dtype = dtypes.canonicalize_dtype(new_dtype or old_dtype)
+  new_weak_type = bool(weak_type)
+
+  if (dtypes.issubdtype(old_dtype, np.complexfloating) and
+      not dtypes.issubdtype(new_dtype, np.complexfloating)):
+    msg = "Casting complex values to real discards the imaginary part"
+    warnings.warn(msg, np.ComplexWarning, stacklevel=2)
+
+  # Python has big integers, but convert_element_type(2 ** 100, np.float32) need
+  # not be an error since the target dtype fits the value. Handle this case by
+  # converting to a NumPy array before calling bind. Without this step, we'd
+  # first canonicalize the input to a value of dtype int32 or int64, leading to
+  # an overflow error.
+  from jax.interpreters import xla
+  if type(operand) is int:
+    operand = np.asarray(operand, new_dtype)
+
+  if ((old_dtype, old_weak_type) == (new_dtype, new_weak_type)
+      and isinstance(operand, (Tracer, xla.DeviceArray))):
+    return operand
+  else:
+    return convert_element_type_p.bind(operand, new_dtype=new_dtype,
+                                       weak_type=new_weak_type)
+
+def _convert_to_aval_dtype(val, aval):
+  if isinstance(aval, UnshapedArray):
+    if type(val) in literalable_types:
+      return np.asarray(val, aval.dtype)
+    if isinstance(val, np.ndarray):
+      return val.astype(aval.dtype)
+    return _convert_element_type(val, new_dtype=aval.dtype,
+        weak_type=aval.weak_type)
+  return val
+
+
+@enable_x64(True)
 def eval_jaxpr(jaxpr: Jaxpr, consts, *args):
   def read(v):
     if type(v) is Literal:
-      return v.val
+      val = (np.asarray(v.val, v.aval.dtype) if isinstance(v.aval,
+          UnshapedArray) else v.val)
+      return val
     else:
       return env[v]
 
   def write(v, val):
+    _check_aval_type(val, v.aval)
     env[v] = val
 
   env: Dict[Var, Any] = {}
   write(unitvar, unit)
+  consts = map(_convert_to_aval_dtype, consts, [v.aval for v in jaxpr.constvars])
+  args = map(_convert_to_aval_dtype, args, [v.aval for v in jaxpr.invars])
   map(write, jaxpr.constvars, consts)
   map(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
@@ -1885,7 +1942,7 @@ def _check_jaxpr(jaxpr: Jaxpr, in_avals: Sequence[AbstractValue]):
 
   def read(v: Atom) -> AbstractValue:
     if isinstance(v, Literal):
-      return raise_to_shaped(get_aval(v.val))
+      return v.aval
     else:
       typecheck_assert(v in env, f"Variable '{v}' not defined")
       return env[v]

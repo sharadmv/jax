@@ -2821,7 +2821,7 @@ class APITest(jtu.JaxTestCase):
       return x, None
     def f_rev(_, g):
       assert len(refs) != 2 or refs[0]() is None
-      zero = np.zeros(())
+      zero = np.zeros((), g.dtype)
       refs.append(weakref.ref(zero))
       return (zero,)
     f.defvjp(f_fwd, f_rev)

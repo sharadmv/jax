@@ -920,7 +920,7 @@ class HostCallbackTapTest(jtu.JaxTestCase):
                                output_stream=testing_stream)
 
     grad_func = api.grad(func)
-    arg = jnp.float32(5.)
+    arg = jnp.array(5, jnp.float32)
     jaxpr = str(api.make_jaxpr(grad_func)(arg))
     # making the Jaxpr does not print anything
     hcb.barrier_wait()

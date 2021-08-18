@@ -307,12 +307,12 @@ class JaxprTrace(Trace):
     env_tracers = map(self.full_raise, env)
     return jaxpr, out_pvs, consts, env_tracers
 
-  def process_custom_jvp_call(self, prim, fun, jvp, tracers):
+  def process_custom_jvp_call(self, prim, fun, jvp, tracers, *, x64_enabled):
     tracers = map(self.instantiate_const_abstracted, tracers)
     in_avals, in_consts = unzip2(t.pval for t in tracers)  # in_consts are units
     fun = trace_to_subjaxpr(fun, self.main, True)
     fun, aux = partial_eval_wrapper(fun, tuple(in_avals))
-    out_flat = prim.bind(fun, jvp, *in_consts)
+    out_flat = prim.bind(fun, jvp, *in_consts, x64_enabled=x64_enabled)
     out_avals, jaxpr, env = aux()
     out_consts, consts = split_list(out_flat, [len(out_flat)-len(jaxpr.constvars)])
     out_pvals = map(PartialVal, zip(out_avals, out_consts))  # out_consts are units
@@ -336,7 +336,8 @@ class JaxprTrace(Trace):
     eqn = new_eqn_recipe(in_tracers, out_tracers, prim.initial_style,
                          dict(fun_jaxpr=closed_jaxpr,
                               jvp_jaxpr_thunk=jvp_jaxpr_thunk,
-                              num_consts=len(consts) + len(env)),
+                              num_consts=len(consts) + len(env),
+                              x64_enabled=x64_enabled),
                          source_info_util.current())
     for t in out_tracers: t.recipe = eqn
     return out_tracers
@@ -347,12 +348,14 @@ class JaxprTrace(Trace):
     # respect to values over which a custom_jvp function closes is detected.
     raise NotImplementedError  # TODO(mattjj)
 
-  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees):
+  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, *, out_trees,
+      x64_enabled):
     tracers = map(self.instantiate_const_abstracted, tracers)
     in_avals, in_consts = unzip2(t.pval for t in tracers)  # in_consts are units
     fun = trace_to_subjaxpr(fun, self.main, True)
     fun, aux = partial_eval_wrapper(fun, tuple(in_avals))
-    out_flat = prim.bind(fun, fwd, bwd, *in_consts, out_trees=out_trees)
+    out_flat = prim.bind(fun, fwd, bwd, *in_consts, out_trees=out_trees,
+        x64_enabled=x64_enabled)
     out_avals, jaxpr, env = aux()
     out_consts, consts = split_list(out_flat, [len(out_flat)-len(jaxpr.constvars)])
     out_pvals = map(PartialVal, zip(out_avals, out_consts))  # out_consts are units
@@ -377,7 +380,8 @@ class JaxprTrace(Trace):
                          dict(fun_jaxpr=closed_jaxpr,
                               fwd_jaxpr_thunk=fwd_jaxpr_thunk,
                               num_consts=len(consts) + len(env),
-                              bwd=bwd, out_trees=out_trees),
+                              bwd=bwd, out_trees=out_trees,
+                              x64_enabled=x64_enabled),
                          source_info_util.current())
     for t in out_tracers: t.recipe = eqn
     return out_tracers
@@ -1124,7 +1128,7 @@ class DynamicJaxprTrace(core.Trace):
   def post_process_map(self, map_primitive, out_tracers, params):
     assert False  # unreachable
 
-  def process_custom_jvp_call(self, prim, fun, jvp, tracers):
+  def process_custom_jvp_call(self, prim, fun, jvp, tracers, *, x64_enabled):
     in_avals = [t.aval for t in tracers]
     with core.new_sublevel():
       fun_jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(fun, self.main, in_avals)
@@ -1138,7 +1142,8 @@ class DynamicJaxprTrace(core.Trace):
     eqn = new_jaxpr_eqn([*constvars, *invars], outvars, prim.initial_style,
                         dict(fun_jaxpr=closed_fun_jaxpr,
                              jvp_jaxpr_thunk=jvp_jaxpr_thunk,
-                             num_consts=len(consts)),
+                             num_consts=len(consts),
+                             x64_enabled=x64_enabled),
                         source_info_util.current())
     self.frame.eqns.append(eqn)
     return out_tracers
@@ -1146,7 +1151,8 @@ class DynamicJaxprTrace(core.Trace):
   def post_process_custom_jvp_call(self, out_tracers, params):
     assert False  # unreachable
 
-  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees):
+  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, *, out_trees,
+      x64_enabled):
     in_avals = [t.aval for t in tracers]
     with core.new_sublevel():
       fun_jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(fun, self.main, in_avals)
@@ -1161,7 +1167,8 @@ class DynamicJaxprTrace(core.Trace):
                         dict(fun_jaxpr=closed_fun_jaxpr,
                              fwd_jaxpr_thunk=fwd_jaxpr_thunk,
                              num_consts=len(consts),
-                             bwd=bwd, out_trees=out_trees),
+                             bwd=bwd, out_trees=out_trees,
+                             x64_enabled=x64_enabled),
                         source_info_util.current())
     self.frame.eqns.append(eqn)
     return out_tracers

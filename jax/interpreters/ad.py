@@ -17,13 +17,15 @@ import functools
 import itertools as it
 from typing import Any, Callable, Dict
 
+import numpy as np
 import jax
 from . import partial_eval as pe
 from ..config import config
 from .. import core
+from .._src.config import enable_x64
 from .._src.dtypes import dtype, float0
 from ..core import (Trace, Tracer, get_aval, call_p, Primitive, Literal,
-                    raise_to_shaped)
+                    raise_to_shaped, UnshapedArray)
 from .._src.ad_util import (add_jaxvals, add_jaxvals_p, zeros_like_jaxval,
                               zeros_like_aval, zeros_like_p, Zero)
 from .._src.util import (unzip2, safe_map, safe_zip, partial, split_list,
@@ -116,9 +118,13 @@ def vjp(traceable, primals, has_aux=False, reduce_axes=()):
   else:
     out_primals, pvals, jaxpr, consts, aux = linearize(traceable, *primals, has_aux=True)
 
+  ct_dtypes = [a.aval.dtype if isinstance(a.aval, UnshapedArray) else None
+      for a in jaxpr.outvars]
+
   def unbound_vjp(pvals, jaxpr, consts, *cts):
     cts = tuple(map(ignore_consts, cts, pvals))
     dummy_args = [UndefinedPrimal(v.aval) for v in jaxpr.invars]
+    avals = [p.get_aval() for p in pvals]
     arg_cts = backward_pass(jaxpr, reduce_axes, consts, dummy_args, cts)
     return map(instantiate_zeros, arg_cts)
 
@@ -126,9 +132,9 @@ def vjp(traceable, primals, has_aux=False, reduce_axes=()):
   # pass in a custom VJP.
   vjp_ =  Partial(partial(unbound_vjp, pvals, jaxpr), consts)
   if not has_aux:
-    return out_primals, vjp_
+    return out_primals, vjp_, ct_dtypes
   else:
-    return out_primals, vjp_, aux
+    return out_primals, vjp_, ct_dtypes, aux
 
 def ignore_consts(ct, pval):
   aval, const = pval
@@ -161,7 +167,10 @@ def recast_to_float0(primal, tangent):
     return tangent
 
 # NOTE: The FIXMEs below are caused by primal/tangent mixups (type errors if you will)
+@enable_x64(True)
 def backward_pass(jaxpr: core.Jaxpr, reduce_axes, consts, primals_in, cotangents_in):
+  cotangents_in = [core.convert_to_aval_dtype(ct, v.aval)
+      for ct, v in zip(cotangents_in, jaxpr.outvars)]
   if all(type(ct) is Zero for ct in cotangents_in):
     return map(lambda v: Zero(v.aval), jaxpr.invars)
 
@@ -341,7 +350,7 @@ class JVPTrace(Trace):
   process_map = process_call
   post_process_map = post_process_call
 
-  def process_custom_jvp_call(self, _, __, f_jvp, tracers):
+  def process_custom_jvp_call(self, _, __, f_jvp, tracers, *, x64_enabled):
     primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
     primals_in = map(core.full_lower, primals_in)
     tangents_in = map(instantiate_zeros, tangents_in)
@@ -356,7 +365,8 @@ class JVPTrace(Trace):
   def post_process_custom_jvp_call(self, out_tracers, params):
     raise CustomJVPException()
 
-  def process_custom_vjp_call(self, _, __, fwd, bwd, tracers, *, out_trees):
+  def process_custom_vjp_call(self, _, __, fwd, bwd, tracers, *, out_trees,
+      x64_enabled):
     primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
     tangents_in = map(instantiate_zeros, tangents_in)
     res_and_primals_out = fwd.call_wrapped(*map(core.full_lower, primals_in))
@@ -365,7 +375,8 @@ class JVPTrace(Trace):
     avals_out = [raise_to_shaped(core.get_aval(x)) for x in primals_out]
     tangents_out = custom_lin_p.bind(
         *res, *tangents_in, num_res=res_tree.num_leaves, bwd=bwd,
-        avals_out=avals_out)
+        avals_out=avals_out,
+        x64_enabled=x64_enabled)
     tangents_out = map(recast_to_float0, primals_out, tangents_out)
     return map(partial(JVPTracer, self), primals_out, tangents_out)
 
@@ -679,10 +690,11 @@ def _raise_custom_vjp_error_on_jvp(*_, **__):
                   "function.")
 custom_lin_p.def_impl(_raise_custom_vjp_error_on_jvp)
 
-def _custom_lin_transpose(cts_out, *invals, num_res, bwd, avals_out):
+def _custom_lin_transpose(cts_out, *invals, num_res, bwd, avals_out, x64_enabled):
   res, _ = split_list(invals, [num_res])
   cts_out = map(instantiate_zeros_aval, avals_out, cts_out)
-  cts_in = bwd.call_wrapped(*res, *cts_out)
+  with enable_x64(x64_enabled):
+    cts_in = bwd.call_wrapped(*res, *cts_out)
   return [None] * num_res + list(cts_in)
 primitive_transposes[custom_lin_p] = _custom_lin_transpose
 

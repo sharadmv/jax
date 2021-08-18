@@ -223,11 +223,11 @@ class BatchTrace(Trace):
       todo = (todo, out_axes_transform)
     return vals, todo
 
-  def process_custom_jvp_call(self, prim, fun, jvp, tracers):
+  def process_custom_jvp_call(self, prim, fun, jvp, tracers, *, x64_enabled):
     in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in tracers)
     fun, out_dims1 = batch_subtrace(fun, self.main, in_dims)
     jvp, out_dims2 = batch_custom_jvp_subtrace(jvp, self.main, in_dims)
-    out_vals = prim.bind(fun, jvp, *in_vals)
+    out_vals = prim.bind(fun, jvp, *in_vals, x64_enabled=x64_enabled)
     fst, out_dims = lu.merge_linear_aux(out_dims1, out_dims2)
     if not fst:
       assert out_dims == out_dims[:len(out_dims) // 2] * 2
@@ -242,7 +242,8 @@ class BatchTrace(Trace):
       return map(partial(BatchTracer, trace), vals, dims)
     return vals, todo
 
-  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, *, out_trees):
+  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, *, out_trees,
+      x64_enabled):
     in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in tracers)
     axis_size, = {x.shape[d] for x, d in zip(in_vals, in_dims)
                   if d is not not_mapped}
@@ -250,7 +251,8 @@ class BatchTrace(Trace):
     fwd, out_dims2 = batch_subtrace(fwd, self.main, in_dims)
     bwd = batch_custom_vjp_bwd(bwd, self.axis_name, axis_size,
                                out_dims2, in_dims, self.main.trace_type)
-    out_vals = prim.bind(fun, fwd, bwd, *in_vals, out_trees=out_trees)
+    out_vals = prim.bind(fun, fwd, bwd, *in_vals, out_trees=out_trees,
+        x64_enabled=x64_enabled)
     fst, out_dims = lu.merge_linear_aux(out_dims1, out_dims2)
     if not fst:
       out_dims = out_dims[-len(out_vals) % len(out_dims):]

@@ -177,20 +177,19 @@ class CallbackTrace(Trace):
     vals_out = call_primitive.bind(f, *vals_in, **params)
     return [CallbackTracer(self, val) for val in vals_out]
 
-  def process_custom_jvp_call(self, primitive, fun, jvp, tracers):
+  def process_custom_jvp_call(self, primitive, fun, jvp, tracers, **params):
     vals_in = [t.val for t in tracers]
     fun = callback_subtrace(fun, self.main)
     jvp = callback_subtrace(jvp, self.main)
-    out = primitive.bind(fun, jvp, *vals_in)
+    out = primitive.bind(fun, jvp, *vals_in, **params)
     return safe_map(self.pure, out)
 
-  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers,
-                              out_trees):
+  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, **params):
     vals_in = [t.val for t in tracers]
     fun = callback_subtrace(fun, self.main)
     fwd = callback_subtrace(fwd, self.main)
     bwd = callback_subtrace(bwd, self.main)
-    out = primitive.bind(fun, fwd, bwd, *vals_in, out_trees=out_trees)
+    out = primitive.bind(fun, fwd, bwd, *vals_in, **params)
     return safe_map(self.pure, out)
 
 custom_callback_rules: Dict[Any, Any] = {}

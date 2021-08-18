@@ -373,7 +373,7 @@ def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
     return convert_element_type_p.bind(operand, new_dtype=new_dtype,
                                        weak_type=new_weak_type)
 
-def _convert_to_aval_dtype(val, aval):
+def convert_to_aval_dtype(val, aval):
   if isinstance(aval, UnshapedArray):
     if type(val) in literalable_types:
       return np.asarray(val, aval.dtype)
@@ -400,8 +400,8 @@ def eval_jaxpr(jaxpr: Jaxpr, consts, *args):
 
   env: Dict[Var, Any] = {}
   write(unitvar, unit)
-  consts = map(_convert_to_aval_dtype, consts, [v.aval for v in jaxpr.constvars])
-  args = map(_convert_to_aval_dtype, args, [v.aval for v in jaxpr.invars])
+  consts = map(convert_to_aval_dtype, consts, [v.aval for v in jaxpr.constvars])
+  args = map(convert_to_aval_dtype, args, [v.aval for v in jaxpr.invars])
   map(write, jaxpr.constvars, consts)
   map(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
@@ -482,12 +482,13 @@ class Trace:
            "primitives")
     raise NotImplementedError(msg)
 
-  def process_custom_jvp_call(self, primitive, fun, jvp, tracers):
+  def process_custom_jvp_call(self, primitive, fun, jvp, tracers, *, x64_enabled):
     msg = (f"{type(self)} must override process_custom_jvp_call "
            "to handle custom_jvp primitives")
     raise NotImplementedError(msg)
 
-  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, out_trees):
+  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, *,
+      out_trees, x64_enabled):
     msg = (f"{type(self)} must override process_custom_vjp_call "
            "to handle custom_vjp primitives")
     raise NotImplementedError(msg)
@@ -667,12 +668,13 @@ class EvalTrace(Trace):
     return primitive.impl(f, *tracers, **params)
   process_map = process_call
 
-  def process_custom_jvp_call(self, primitive, fun, jvp, tracers):
+  def process_custom_jvp_call(self, primitive, fun, jvp, tracers, x64_enabled):
     del primitive, jvp  # Unused.
     with new_sublevel():
       return fun.call_wrapped(*tracers)
 
-  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, out_trees):
+  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers,
+      out_trees, x64_enabled):
     del primitive, fwd, bwd, out_trees  # Unused.
     with new_sublevel():
       return fun.call_wrapped(*tracers)
@@ -1983,7 +1985,7 @@ def _check_jaxpr(jaxpr: Jaxpr, in_avals: Sequence[AbstractValue]):
       src = source_info_util.summarize(eqn.source_info)
       msg = "\n\n".join([msg, "in equation:", str(pp_eqn(eqn).indent(2)),
                          f"from source: {src}"])
-      raise JaxprTypeError(msg, eqn_idx) from None
+      raise JaxprTypeError(msg, eqn_idx) from e
 
   map(read, jaxpr.outvars)
 

@@ -873,9 +873,8 @@ def value_and_grad(fun: Callable, argnums: Union[int, Sequence[int]] = 0,
       ans, vjp_py, aux = _vjp(
           f_partial, *dyn_args, has_aux=True, reduce_axes=reduce_axes)
     _check_scalar(ans)
-    dtype = dtypes.result_type(ans)
     tree_map(partial(_check_output_dtype_grad, holomorphic), ans)
-    g = vjp_py(np.ones((), dtype=dtype))
+    g = vjp_py(1.)
     g = g[0] if isinstance(argnums, int) else g
     if not has_aux:
       return ans, g
@@ -2029,12 +2028,13 @@ def _vjp_pullback_wrapper(cotangent_dtypes, cotangent_shapes,
     raise TypeError(f"Tree structure of cotangent input {in_tree}, does not match structure of "
                     f"primal output {in_tree_expected}.")
   for arg, ct_dtype, ct_shape in safe_zip(args, cotangent_dtypes, cotangent_shapes):
-    expected_tangent_dtype = core.primal_dtype_to_tangent_dtype(_dtype(arg))
-    if expected_tangent_dtype != ct_dtype:
-      raise TypeError(
-          f"Type of cotangent input to vjp pullback function ({ct_dtype}) is not "
-          f"the expected tangent type ({expected_tangent_dtype}) of corresponding primal output "
-          f"with dtype {_dtype(arg)}.")
+    if ct_dtype and type(arg) not in {float, int}:
+      expected_tangent_dtype = core.primal_dtype_to_tangent_dtype(_dtype(arg))
+      if expected_tangent_dtype != ct_dtype:
+        raise TypeError(
+            f"Type of cotangent input to vjp pullback function ({ct_dtype}) is not "
+            f"the expected tangent type ({expected_tangent_dtype}) of corresponding primal output "
+            f"with dtype {_dtype(arg)}.")
     if np.shape(arg) != ct_shape:
       raise ValueError(
           f"Shape of cotangent input to vjp pullback function {np.shape(arg)} "
@@ -2133,16 +2133,15 @@ def _vjp(fun: lu.WrappedFun, *primals, has_aux=False, reduce_axes=()):
   for arg in primals_flat: _check_arg(arg)
   if not has_aux:
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
-    out_primal, out_vjp = ad.vjp(
+    out_primal, out_vjp, ct_dtypes = ad.vjp(
         flat_fun, primals_flat, reduce_axes=reduce_axes)
     out_tree = out_tree()
   else:
     flat_fun, out_aux_trees = flatten_fun_nokwargs2(fun, in_tree)
-    out_primal, out_vjp, aux = ad.vjp(
+    out_primal, out_vjp, ct_dtypes, aux = ad.vjp(
         flat_fun, primals_flat, has_aux=True, reduce_axes=reduce_axes)
     out_tree, aux_tree = out_aux_trees()
   out_primal_py = tree_unflatten(out_tree, out_primal)
-  ct_dtypes = [core.primal_dtype_to_tangent_dtype(_dtype(x)) for x in out_primal]
   ct_shapes = [np.shape(x) for x in out_primal]
   # Ensure that vjp_py is a PyTree so that we can pass it from the forward to the
   # backward pass in a custom VJP.

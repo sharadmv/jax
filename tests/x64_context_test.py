@@ -20,7 +20,11 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 from jax._src import api
+from jax import custom_jvp
+from jax import custom_vjp
+from jax import grad
 from jax import jit
+from jax import jvp
 from jax import lax
 from jax import partial
 from jax import random
@@ -172,11 +176,96 @@ class X64ContextTests(jtu.JaxTestCase):
           assert y.dtype == jnp.int64
           z = y.astype(jnp.int32)
         return carry, (z, y)
-      return lax.scan(body, 2, jnp.arange(4))
+      return lax.scan(body, jnp.int32(2), jnp.arange(4))
     carry_out, ys_out = f(3)
     self.assertEqual(carry_out.dtype, jnp.int32)
     self.assertEqual(ys_out[0].dtype, jnp.int32)
     self.assertEqual(ys_out[1].dtype, jnp.int64)
+
+  def test_python_scan_with_contextmanager(self):
+    def f(a):
+      def body(carry, _):
+        with enable_x64():
+          y = jnp.array(carry + a, jnp.int64)
+          assert y.dtype == jnp.int64
+          z = y.astype(jnp.int32)
+        return carry, (z, y)
+      carry, xs = jnp.int32(2), jnp.arange(4)
+      ys1, ys2 = [], []
+      for i in range(4):
+        carry, (y1, y2) = body(carry, xs[i])
+        ys1.append(y1)
+        ys2.append(y2)
+      return carry, (ys1, ys2)
+    carry_out, ys_out = f(3)
+    self.assertEqual(carry_out.dtype, jnp.int32)
+    for i in range(4):
+      self.assertEqual(ys_out[0][i].dtype, jnp.int32)
+      self.assertEqual(ys_out[1][i].dtype, jnp.int64)
+
+  def test_custom_jvp(self):
+
+    @custom_jvp
+    def f(x):
+      return x ** 2.
+
+    @f.defjvp
+    def f_jvp(xs, ts):
+      x, = xs
+      t, = ts
+      self.assertTrue(config.x64_enabled)
+      return f(x), t * jnp.sin(x)
+
+    def g(x):
+      with enable_x64():
+        x = jnp.array(x, jnp.float64)
+        return f(x)
+
+
+    self.assertEqual(g(5.).dtype, jnp.float64)
+    out_primal, out_tangent = jvp(g, (5.,), (1.,))
+    self.assertEqual(out_primal.dtype, jnp.float64)
+    self.assertEqual(out_tangent.dtype, jnp.float64)
+
+    self.assertEqual(g(5.).dtype, jnp.float64)
+    self.assertEqual(grad(g)(5.).dtype, jnp.float32)
+    self.assertEqual(grad(grad(g))(5.).dtype, jnp.float32)
+    self.assertEqual(grad(grad(grad(g)))(5.).dtype, jnp.float32)
+
+    with enable_x64(True):
+      self.assertEqual(g(5.).dtype, jnp.float64)
+      self.assertEqual(grad(g)(5.).dtype, jnp.float64)
+      self.assertEqual(grad(grad(g))(5.).dtype, jnp.float64)
+      self.assertEqual(grad(grad(grad(g)))(5.).dtype, jnp.float64)
+
+  def test_custom_vjp(self):
+
+    @custom_vjp
+    def f(x):
+      return x ** 2.
+
+    def f_fwd(x):
+      return f(x), jnp.sin(x)
+
+    def f_bwd(res, t):
+      return (res * t,)
+    f.defvjp(f_fwd, f_bwd)
+
+    def g(x):
+      with enable_x64():
+        x = jnp.array(x, jnp.float64)
+        return f(x)
+
+    self.assertEqual(g(5.).dtype, jnp.float64)
+    self.assertEqual(grad(g)(5.).dtype, jnp.float32)
+    self.assertEqual(grad(grad(g))(5.).dtype, jnp.float32)
+    self.assertEqual(grad(grad(grad(g)))(5.).dtype, jnp.float32)
+
+    with enable_x64(True):
+      self.assertEqual(g(5.).dtype, jnp.float64)
+      self.assertEqual(grad(g)(5.).dtype, jnp.float64)
+      self.assertEqual(grad(grad(g))(5.).dtype, jnp.float64)
+      self.assertEqual(grad(grad(grad(g)))(5.).dtype, jnp.float64)
 
 
 if __name__ == "__main__":

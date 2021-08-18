@@ -213,7 +213,8 @@ class custom_jvp(Generic[ReturnValue]):
     args_flat, in_tree = tree_flatten(dyn_args)
     flat_fun, out_tree1 = flatten_fun_nokwargs(f_, in_tree)
     flat_jvp, out_tree2 = _flatten_jvp(jvp, in_tree)
-    out_flat = custom_jvp_call_p.bind(flat_fun, flat_jvp, *args_flat)
+    out_flat = custom_jvp_call_p.bind(flat_fun, flat_jvp, *args_flat,
+        x64_enabled=config.x64_enabled)
     _, out_tree = lu.merge_linear_aux(out_tree1, out_tree2)
     return tree_unflatten(out_tree, out_flat)
 
@@ -267,7 +268,7 @@ def _flatten_jvp(in_tree, *args):
 class CustomJVPCallPrimitive(core.CallPrimitive):
   initial_style: core.Primitive
 
-  def bind(self, fun, jvp, *args):
+  def bind(self, fun, jvp, *args, x64_enabled):
     args = map(core.full_lower, args)
     top_trace = core.find_top_trace(args)
     fun, env_trace_todo1 = core.process_env_traces(
@@ -275,7 +276,8 @@ class CustomJVPCallPrimitive(core.CallPrimitive):
     jvp, env_trace_todo2 = core.process_env_traces(
         jvp, self, top_trace and top_trace.level, (), None)
     tracers = map(top_trace.full_raise, args)  # type: ignore
-    outs = top_trace.process_custom_jvp_call(self, fun, jvp, tracers)  # type: ignore
+    outs = top_trace.process_custom_jvp_call(self, fun, jvp, tracers,
+        x64_enabled=x64_enabled)  # type: ignore
     _, env_trace_todo = lu.merge_linear_aux(env_trace_todo1, env_trace_todo2)
     return _apply_todos(env_trace_todo, map(core.full_lower, outs))
 
@@ -312,12 +314,12 @@ CustomJVPCallPrimitive.initial_style = custom_jvp_call_jaxpr_p
 def _custom_jvp_call_jaxpr_jvp(
     primals, tangents, *, fun_jaxpr: core.ClosedJaxpr,
     jvp_jaxpr_thunk: Callable[[], Tuple[core.Jaxpr, Sequence[Any]]],
-    num_consts: int):
+    num_consts: int, x64_enabled: bool):
   _, args = split_list(primals, [num_consts])
   consts_dot, args_dot = split_list(tangents, [num_consts])
   if any(type(t) is not Zero for t in consts_dot):
     raise ad.CustomJVPException()
-  with enable_x64(False):
+  with enable_x64(x64_enabled):
     jvp_jaxpr, jvp_consts = jvp_jaxpr_thunk()  # consts can be tracers!
   args_dot = map(ad.instantiate_zeros, args_dot)
   # Cast float0 to zeros with the primal dtype because custom jvp rules don't
@@ -332,7 +334,7 @@ ad.primitive_jvps[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_jvp
 def _custom_jvp_call_jaxpr_vmap(
     args, in_dims, axis_name, main_type, *, fun_jaxpr: core.ClosedJaxpr,
     jvp_jaxpr_thunk: Callable[[], Tuple[core.Jaxpr, Sequence[Any]]],
-    num_consts: int):
+    num_consts: int, x64_enabled: bool):
   size, = {x.shape[d] for x, d in zip(args, in_dims) if d is not not_mapped}
   args = [batching.moveaxis(x, d, 0) if d is not not_mapped and d != 0
           else x for x, d in zip(args, in_dims)]
@@ -346,7 +348,7 @@ def _custom_jvp_call_jaxpr_vmap(
 
   @pe._memoize
   def batched_jvp_jaxpr_thunk():
-    with enable_x64(False):
+    with enable_x64(x64_enabled):
       jvp_jaxpr = core.ClosedJaxpr(*jvp_jaxpr_thunk())  # consts can be tracers
     _, args_batched = split_list(in_batched, [num_consts])
     _, all_batched = batching.batch_jaxpr(jvp_jaxpr, size, args_batched * 2, False,
@@ -361,7 +363,8 @@ def _custom_jvp_call_jaxpr_vmap(
 
   batched_outs = custom_jvp_call_jaxpr_p.bind(
       *args, fun_jaxpr=batched_fun_jaxpr,
-      jvp_jaxpr_thunk=batched_jvp_jaxpr_thunk, num_consts=num_consts)
+      jvp_jaxpr_thunk=batched_jvp_jaxpr_thunk, num_consts=num_consts,
+      x64_enabled=x64_enabled)
   out_dims = out_dims2[0] if out_dims2 else out_dims1
   return batched_outs, out_dims
 batching.initial_style_batchers[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_vmap
@@ -373,8 +376,8 @@ xla.initial_style_translations[custom_jvp_call_jaxpr_p] = \
 # custom_jvp_call_jaxpr can appear in jaxprs to be transposed. Since it's
 # already been linearized, we can drop the jvp rule.
 def _custom_jvp_call_jaxpr_transpose(reduce_axes, cts, *args, fun_jaxpr,
-                                     jvp_jaxpr_thunk, num_consts):
-  del jvp_jaxpr_thunk, num_consts
+                                     jvp_jaxpr_thunk, num_consts, x64_enabled):
+  del jvp_jaxpr_thunk, num_consts, x64_enabled
   return ad.backward_pass(
       fun_jaxpr.jaxpr, reduce_axes, fun_jaxpr.consts, args, cts)
 ad.reducing_transposes[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_transpose
@@ -492,7 +495,8 @@ class custom_vjp(Generic[ReturnValue]):
     flat_fwd, out_trees = _flatten_fwd(fwd, in_tree)
     flat_bwd = _flatten_bwd(bwd, in_tree, in_avals, out_trees)
     out_flat = custom_vjp_call_p.bind(flat_fun, flat_fwd, flat_bwd, *args_flat,
-                                      out_trees=out_trees)
+                                      out_trees=out_trees,
+                                      x64_enabled=config.x64_enabled)
     fst, aux = lu.merge_linear_aux(out_tree, out_trees)
     out_tree = aux if fst else aux[0]
     return tree_unflatten(out_tree, out_flat)
@@ -563,7 +567,7 @@ def _flatten_bwd(in_tree, in_avals, out_trees, *args):
 class CustomVJPCallPrimitive(core.CallPrimitive):
   initial_style: core.Primitive
 
-  def bind(self, fun, fwd, bwd, *args, out_trees):
+  def bind(self, fun, fwd, bwd, *args, out_trees, x64_enabled):
     args = map(core.full_lower, args)
     top_trace = core.find_top_trace(args)
     fun, env_trace_todo1 = core.process_env_traces(
@@ -572,12 +576,13 @@ class CustomVJPCallPrimitive(core.CallPrimitive):
         fwd, self, top_trace and top_trace.level, (), None)
     tracers = map(top_trace.full_raise, args)  # type: ignore
     outs = top_trace.process_custom_vjp_call(self, fun, fwd, bwd, tracers,
-                                              out_trees=out_trees)
+                                             out_trees=out_trees,
+                                             x64_enabled=x64_enabled)
     _, env_trace_todo = lu.merge_linear_aux(env_trace_todo1, env_trace_todo2)
     return _apply_todos(env_trace_todo, map(core.full_lower, outs))
 
-  def impl(self, fun, fwd, bwd, *args, out_trees):
-    del fwd, bwd, out_trees
+  def impl(self, fun, fwd, bwd, *args, out_trees, x64_enabled):
+    del fwd, bwd, out_trees, x64_enabled
     with core.new_sublevel():
       return fun.call_wrapped(*args)
 
@@ -600,12 +605,12 @@ CustomVJPCallPrimitive.initial_style = custom_vjp_call_jaxpr_p
 def _custom_vjp_call_jaxpr_jvp(
     primals, tangents, *, fun_jaxpr: core.ClosedJaxpr,
     fwd_jaxpr_thunk: Callable[[], Tuple[core.Jaxpr, Sequence[Any]]],
-    bwd: lu.WrappedFun, out_trees: Callable, num_consts: int):
+    bwd: lu.WrappedFun, out_trees: Callable, num_consts: int, x64_enabled: bool):
   _, args = split_list(primals, [num_consts])
   consts_dot, args_dot = split_list(tangents, [num_consts])
   if any(type(t) is not Zero for t in consts_dot):
     raise ad.CustomVJPException()
-  with enable_x64(False):
+  with enable_x64(x64_enabled):
     fwd_jaxpr, fwd_consts = fwd_jaxpr_thunk()  # consts can be tracers!
   out_tree, res_tree = out_trees()
   args_dot = map(ad.instantiate_zeros, args_dot)
@@ -616,7 +621,9 @@ def _custom_vjp_call_jaxpr_jvp(
   res, primals_out = split_list(res_and_primals_out, [res_tree.num_leaves])
   avals_out = [raise_to_shaped(core.get_aval(x)) for x in primals_out]
   tangents_out = ad.custom_lin_p.bind(
-      *res, *args_dot, num_res=res_tree.num_leaves, bwd=bwd, avals_out=avals_out)
+      *res, *args_dot, num_res=res_tree.num_leaves, bwd=bwd,
+      avals_out=avals_out,
+      x64_enabled=x64_enabled)
   tangents_out = map(ad.recast_to_float0, primals_out, tangents_out)
   return primals_out, tangents_out
 ad.primitive_jvps[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_jvp
@@ -624,7 +631,8 @@ ad.primitive_jvps[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_jvp
 def _custom_vjp_call_jaxpr_vmap(
     args, in_dims, axis_name, main_type, *, fun_jaxpr: core.ClosedJaxpr,
     fwd_jaxpr_thunk: Callable[[], Tuple[core.Jaxpr, Sequence[Any]]],
-    bwd: lu.WrappedFun, out_trees: Callable, num_consts: int):
+    bwd: lu.WrappedFun, out_trees: Callable, num_consts: int,
+    x64_enabled: bool):
   axis_size, = {x.shape[d] for x, d in zip(args, in_dims) if d is not not_mapped}
   args = [batching.moveaxis(x, d, 0) if d is not not_mapped and d != 0
           else x for x, d in zip(args, in_dims)]
@@ -638,7 +646,7 @@ def _custom_vjp_call_jaxpr_vmap(
 
   @pe._memoize
   def batched_fwd_jaxpr_thunk():
-    with enable_x64(False):
+    with enable_x64(x64_enabled):
       fwd_jaxpr = core.ClosedJaxpr(*fwd_jaxpr_thunk())  # consts can be tracers
     batched_fwd_jaxpr, out_batched = batching.batch_jaxpr(
         fwd_jaxpr, axis_size, args_batched, False, axis_name, main_type)
@@ -653,7 +661,8 @@ def _custom_vjp_call_jaxpr_vmap(
   batched_outs = custom_vjp_call_jaxpr_p.bind(
       *args, fun_jaxpr=batched_fun_jaxpr,
       fwd_jaxpr_thunk=batched_fwd_jaxpr_thunk, bwd=batched_bwd,
-      out_trees=out_trees, num_consts=num_consts)
+      out_trees=out_trees, num_consts=num_consts,
+      x64_enabled=x64_enabled)
   out_dims = out_dims2[0] if out_dims2 else out_dims1
   return batched_outs, out_dims
 batching.initial_style_batchers[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_vmap

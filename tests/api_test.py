@@ -2462,7 +2462,8 @@ class APITest(jtu.JaxTestCase):
 
     @jit
     def f():
-      core.lattice_join(core.ConcreteArray(x), core.ConcreteArray(y))
+      core.lattice_join(core.ConcreteArray(x, jnp.float32),
+          core.ConcreteArray(y, jnp.float32))
 
     f()  # doesn't crash
 
@@ -3077,11 +3078,11 @@ class RematTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
     jaxpr = api.make_jaxpr(api.linearize(f_yesremat, 4.)[1])(1.)
-    scan_eqn, = jaxpr.jaxpr.eqns
+    _, scan_eqn = jaxpr.jaxpr.eqns
     self.assertIn(' cos ', str(scan_eqn.params['jaxpr']))
 
     jaxpr = api.make_jaxpr(api.vjp(f_yesremat, 4.)[1])(1.)
-    scan_eqn, = jaxpr.jaxpr.eqns
+    _, scan_eqn, _ = jaxpr.jaxpr.eqns
     self.assertIn(' cos ', str(scan_eqn.params['jaxpr']))
 
   def test_remat_no_redundant_flops(self):

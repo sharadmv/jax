@@ -724,7 +724,7 @@ def _register_handlers_for_sharded_device_array(sda):
   shard_arg_handlers[sda] = _shard_sharded_device_array_slow_path
   xb.register_constant_handler(sda, _sharded_device_array_constant_handler)
 
-  core.pytype_aval_mappings[sda] = ConcreteArray
+  core.pytype_aval_mappings[sda] = xla.device_array_to_aval
   xla.device_put_handlers[sda] = xla._device_put_array
   xla.pytype_aval_mappings[sda] = op.attrgetter("aval")
   xla.canonicalize_dtype_handlers[sda] = identity

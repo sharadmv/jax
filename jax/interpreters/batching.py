@@ -81,7 +81,7 @@ NotMapped = type(None)
 not_mapped = None
 
 class BatchTracer(Tracer):
-  __slots__ = ['val', 'batch_dim']
+  __slots__ = ['val', 'batch_dim', '_aval']
 
   def __init__(self, trace, val, batch_dim: Optional[int]):
     if config.jax_enable_checks:
@@ -93,13 +93,16 @@ class BatchTracer(Tracer):
     self.val = val
     self.batch_dim = batch_dim
 
+    aval = raise_to_shaped(core.get_aval(self.val))
+    self.val = core.convert_to_aval_dtype(self.val, aval)
+    if self.batch_dim is not_mapped or aval is core.abstract_unit:
+      self._aval = aval
+    else:
+      self._aval = core.mapped_aval(aval.shape[self.batch_dim], batch_dim, aval)
+
   @property
   def aval(self):
-    aval = raise_to_shaped(core.get_aval(self.val))
-    if self.batch_dim is not_mapped or aval is core.abstract_unit:
-      return aval
-    else:
-      return core.mapped_aval(aval.shape[self.batch_dim], self.batch_dim, aval)
+    return self._aval
 
   def full_lower(self):
     if self.batch_dim is not_mapped:

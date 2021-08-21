@@ -272,7 +272,8 @@ def arg_spec(x: Any) -> ArgSpec:
 def apply_primitive(prim, *args, **params):
   """Impl rule that compiles and runs a single primitive 'prim' using XLA."""
   compiled_fun = xla_primitive_callable(prim, *unsafe_map(arg_spec, args), **params)
-  return compiled_fun(*args)
+  out = compiled_fun(*args)
+  return out
 
 
 def _partition_outputs(avals, outs):
@@ -1341,9 +1342,12 @@ for device_array in [DeviceArray]:
 class DeletedBuffer(object): pass
 deleted_buffer = DeletedBuffer()
 
+def device_array_to_aval(x):
+  return ConcreteArray(x, x.dtype)
+
 for device_array in [_CppDeviceArray, _DeviceArray]:
   core.literalable_types.add(device_array)
-  core.pytype_aval_mappings[device_array] = ConcreteArray
+  core.pytype_aval_mappings[device_array] = device_array_to_aval 
   pytype_aval_mappings[device_array] = op.attrgetter('aval')
   canonicalize_dtype_handlers[device_array] = identity
 

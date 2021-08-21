@@ -1226,7 +1226,7 @@ class BatchingTest(jtu.JaxTestCase):
 
   def testNonJaxTypedOutput(self):
     with self.assertRaisesRegex(
-      TypeError, "Output from batched function.*is not a valid JAX type"):
+      TypeError, "Value 'hello' with type <class 'str'> is not a valid JAX type"):
       vmap(lambda x: "hello")(np.arange(5))
 
   def testIssue6096(self):

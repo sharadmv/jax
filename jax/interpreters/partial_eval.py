@@ -63,6 +63,9 @@ class PartialVal(tuple):
 
   @classmethod
   def known(cls, const: core.Value) -> 'PartialVal':
+    aval = get_aval(const)
+    if isinstance(const, (int, float, complex, np.ndarray)):
+      const = np.asarray(const, aval.dtype)
     return PartialVal((None, const))
 
   @classmethod
@@ -107,10 +110,15 @@ class JaxprTrace(Trace):
 
   def new_instantiated_literal(self, val) -> 'JaxprTracer':
     aval = get_aval(val)
+    if isinstance(val, (int, float, complex)):
+      val = np.asarray(val, aval.dtype)
     return JaxprTracer(self, PartialVal.unknown(aval), Literal(val, aval))
 
   def new_instantiated_const(self, val) -> 'JaxprTracer':
-    return JaxprTracer(self, PartialVal.unknown(get_aval(val)), ConstVar(val))
+    aval = get_aval(val)
+    if isinstance(val, (int, float, complex)):
+      val = np.asarray(val, aval.dtype)
+    return JaxprTracer(self, PartialVal.unknown(aval), ConstVar(val, aval))
 
   def new_arg(self, pval: PartialVal) -> 'JaxprTracer':
     const = pval.get_known()
@@ -135,7 +143,7 @@ class JaxprTrace(Trace):
       return tracer
     else:
       aval = raise_to_shaped(get_aval(const), np.isscalar(const))
-      return JaxprTracer(self, PartialVal.unknown(aval), ConstVar(const))
+      return JaxprTracer(self, PartialVal.unknown(aval), ConstVar(const, aval))
 
   def process_primitive(self, primitive, tracers, params):
     if primitive in custom_partial_eval_rules:
@@ -239,6 +247,8 @@ class JaxprTrace(Trace):
 
     eqn = new_eqn_recipe(in_tracers, unknown_tracers_out, primitive, new_params,
                          source_info_util.current())
+    for t, invar in zip(in_tracers, new_params['call_jaxpr'].invars):
+      assert t.aval.dtype == invar.aval.dtype
     for t in unknown_tracers_out: t.recipe = eqn
     return _zip_knowns(known_tracers_out, unknown_tracers_out, out_unknowns)
 
@@ -422,7 +432,7 @@ JaxprTracerRecipe = Union['JaxprEqnRecipe', 'LambdaBinding', 'FreeVar',
                           'ConstVar', Literal, core.Unit]
 
 class JaxprTracer(Tracer):
-  __slots__ = ['pval', 'recipe']
+  __slots__ = ['pval', 'aval', 'recipe']
 
   def __init__(self, trace: JaxprTrace, pval: PartialVal,
                recipe: Optional[JaxprTracerRecipe]):
@@ -433,14 +443,11 @@ class JaxprTracer(Tracer):
           const, "Tracer from a higher level: {} in trace {}".format(const, trace))
     self._trace = trace
     self.pval = pval
+    self.aval = self.pval.get_aval()
     self.recipe = recipe
 
   def __repr__(self):
     return 'Traced<{}:{}>'.format(self.aval, self._trace)
-
-  @property
-  def aval(self) -> AbstractValue:
-    return self.pval.get_aval()
 
   @property
   def parents(self) -> Sequence['JaxprTracer']:
@@ -541,7 +548,7 @@ def instantiate_const_at(trace: JaxprTrace, instantiate: bool, tracer):
 
 
 FreeVar = namedtuple('FreeVar', ['val'])
-ConstVar = namedtuple('ConstVar', ['val'])
+ConstVar = namedtuple('ConstVar', ['val', 'aval'])
 LambdaBinding = namedtuple('LambdaBinding', [])
 class JaxprEqnRecipe(NamedTuple):
   eqn_id: object
@@ -615,10 +622,10 @@ def tracers_to_jaxpr(
   env: Dict[core.Var, Any] = {}
   consts: Dict[core.Var, Any] = {}
   const_to_var: Dict[int, core.Var] = {}
-  def getconstvar(c):
+  def getconstvar(c, aval):
     var = const_to_var.get(id(c))
     if var is None:
-      var = const_to_var[id(c)] = newvar(get_aval(c))
+      var = const_to_var[id(c)] = newvar(aval)
     return var
   processed_eqn_ids = set()
   for t in sorted_tracers:
@@ -635,8 +642,12 @@ def tracers_to_jaxpr(
     elif isinstance(recipe, FreeVar):
       env[cast(core.Var, getvar(t))] = recipe.val
     elif isinstance(recipe, ConstVar):
-      v = t_to_var[id(t)] = getconstvar(recipe.val)
-      consts[v] = recipe.val
+      v = t_to_var[id(t)] = getconstvar(recipe.val, recipe.aval)
+      val = recipe.val
+      if isinstance(recipe.val, (int, float, np.ndarray)) and isinstance(v.aval,
+          core.UnshapedArray):
+        val = np.array(recipe.val, v.aval.dtype)
+      consts[v] = val
     elif isinstance(recipe, Literal):
       t_to_var[id(t)] = recipe
     elif recipe is unit:

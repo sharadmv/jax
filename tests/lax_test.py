@@ -2387,7 +2387,7 @@ class LaxTest(jtu.JaxTestCase):
   def test_select_jvp_complexity(self):
     jaxpr = jax.make_jaxpr(lambda x: jax.jvp(lambda x: lax.select(True, x, x),
                                              (x,), (1.,)))(1.)
-    self.assertLen(jaxpr.jaxpr.eqns, 2)
+    self.assertLen(jaxpr.jaxpr.eqns, 3)
 
   def testRngBitGenerator(self):
     if not config.x64_enabled:

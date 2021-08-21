@@ -1206,19 +1206,21 @@ class ConcreteArray(ShapedArray):
   __slots__ = ['val']
   array_abstraction_level = 0
 
-  def __init__(self, val, weak_type=False):
-    super().__init__(np.shape(val), np.result_type(val),
+  def __init__(self, val, dtype, weak_type=False):
+    super().__init__(np.shape(val), dtype,
                      weak_type=weak_type)
     # Note: canonicalized self.dtype doesn't necessarily match self.val
     self.val = val
     assert self.dtype != np.dtype('O'), val
 
-  def update(self, val=None, weak_type=None):
+  def update(self, val=None, dtype=None, weak_type=None):
     if val is None:
       val = self.val
     if weak_type is None:
       weak_type = self.weak_type
-    return ConcreteArray(val, weak_type)
+    if dtype is None:
+      dtype = self.dtype
+    return ConcreteArray(val, dtype, weak_type)
 
   def __eq__(self, other):
     if (type(self) is type(other) and self.dtype == other.dtype

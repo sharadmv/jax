@@ -68,8 +68,9 @@ def jvp_subtrace(main, primals, tangents):
   for x in list(primals) + list(tangents):
     if isinstance(x, Tracer):
       assert x._trace.level < trace.level
-  in_tracers = [JVPTracer(trace, x, t) if type(t) is not Zero else x
-                for x, t in zip(primals, tangents)]
+  avals = map(core.get_aval, primals)
+  in_tracers = [JVPTracer(trace, aval, x, t) if type(t) is not Zero else x
+                for aval, x, t in zip(avals, primals, tangents)]
   ans = yield in_tracers, {}
   out_tracers = map(trace.full_raise, ans)
   yield unzip2([(out_tracer.primal, out_tracer.tangent)
@@ -81,7 +82,8 @@ def jvp_subtrace_aux(main, primals, tangents):
   for x in list(primals) + list(tangents):
     if isinstance(x, Tracer):
       assert x._trace.level < trace.level
-  ans, aux = yield map(partial(JVPTracer, trace), primals, tangents), {}
+  avals = map(core.get_aval, primals)
+  ans, aux = yield map(partial(JVPTracer, trace), avals, primals, tangents), {}
   ans_tracers = map(trace.full_raise, ans)
   out_primals, out_tangents = unzip2((t.primal, t.tangent) for t in ans_tracers)
   aux_primals = [core.full_lower(x.primal)
@@ -169,7 +171,8 @@ def recast_to_float0(primal, tangent):
 # NOTE: The FIXMEs below are caused by primal/tangent mixups (type errors if you will)
 @enable_x64(True)
 def backward_pass(jaxpr: core.Jaxpr, reduce_axes, consts, primals_in, cotangents_in):
-  cotangents_in = [core.convert_to_aval_dtype(ct, v.aval)
+  cotangents_in = [core.convert_to_aval_dtype(ct, v.aval) if type(ct) is not
+      Zero else ct
       for ct, v in zip(cotangents_in, jaxpr.outvars)]
   if all(type(ct) is Zero for ct in cotangents_in):
     return map(lambda v: Zero(v.aval), jaxpr.invars)
@@ -188,17 +191,29 @@ def backward_pass(jaxpr: core.Jaxpr, reduce_axes, consts, primals_in, cotangents
                            and axis_name not in v.aval.named_shape)
     if axes_to_reduce:
       ct = jax.lax.psum(ct, axis_name=axes_to_reduce)
+    if isinstance(ct, (int, float, complex, np.ndarray)):
+      ct = np.array(ct, v.aval.dtype)
     ct_env[v] = add_tangents(ct_env[v], ct) if v in ct_env else ct
     if config.jax_enable_checks:
-      ct_aval = core.get_aval(ct_env[v])
+      ct_val = ct_env[v]
+      if isinstance(ct_val, (int, float, complex, np.ndarray)):
+        ct_val = np.array(ct_val, v.aval.dtype)
+      ct_aval = core.get_aval(ct_val)
       joined_aval = core.lattice_join(v.aval, ct_aval).strip_weak_type().strip_named_shape()
       assert v.aval.strip_weak_type().strip_named_shape() == joined_aval, (prim, v.aval, ct_aval)
 
   def read_cotangent(v):
-    return ct_env.pop(v, Zero(v.aval))
+    if v in ct_env:
+      val = ct_env.pop(v)
+      if isinstance(val, (int, float, complex, np.ndarray)):
+        val = np.array(val, v.aval.dtype)
+      return val
+    return Zero(v.aval)
 
   def read_primal(v):
     if type(v) is Literal:
+      if isinstance(v.aval, core.UnshapedArray):
+        return np.asarray(v.val, v.aval.dtype)
       return v.val
     else:
       return primal_env.get(v, UndefinedPrimal(v.aval))
@@ -273,15 +288,17 @@ def nonzero_tangent_outputs(*args, **kwargs):
 class JVPTrace(Trace):
 
   def pure(self, val):
-    tangent_zero = Zero(get_aval(val).at_least_vspace())
-    return JVPTracer(self, val, tangent_zero)
+    aval = get_aval(val)
+    tangent_zero = Zero(aval.at_least_vspace())
+    return JVPTracer(self, aval, val, tangent_zero)
 
   def lift(self, val):
-    tangent_zero = Zero(get_aval(val).at_least_vspace())
-    return JVPTracer(self, val, tangent_zero)
+    aval = get_aval(val)
+    tangent_zero = Zero(aval.at_least_vspace())
+    return JVPTracer(self, aval, val, tangent_zero)
 
   def sublift(self, val):
-    return JVPTracer(self, val.primal, val.tangent)
+    return JVPTracer(self, val.aval, val.primal, val.tangent)
 
   def process_primitive(self, primitive, tracers, params):
     primals_in, tangents_in = unzip2((t.primal, t.tangent) for t in tracers)
@@ -291,9 +308,10 @@ class JVPTrace(Trace):
       raise NotImplementedError(msg)
     primal_out, tangent_out = jvp(primals_in, tangents_in, **params)
     if primitive.multiple_results:
-      return [JVPTracer(self, x, t) for x, t in zip(primal_out, tangent_out)]
+      avals = map(core.get_aval, primal_out)
+      return [JVPTracer(self, a, x, t) for a, x, t in zip(avals, primal_out, tangent_out)]
     else:
-      return JVPTracer(self, primal_out, tangent_out)
+      return JVPTracer(self, core.get_aval(primal_out), primal_out, tangent_out)
 
   def process_call(self, call_primitive, f: lu.WrappedFun, tracers, params):
     assert call_primitive.multiple_results
@@ -326,7 +344,8 @@ class JVPTrace(Trace):
                   if update_params else params)
     result = call_primitive.bind(f_jvp, *primals, *nonzero_tangents, **new_params)
     primal_out, tangent_out = tree_unflatten(out_tree_def(), result)
-    return [JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
+    avals = map(core.get_aval, primal_out)
+    return [JVPTracer(self, a, p, t) for a, p, t in zip(avals, primal_out, tangent_out)]
 
   def post_process_call(self, call_primitive, out_tracers, params):
     primals, tangents = unzip2((t.primal, t.tangent) for t in out_tracers)
@@ -336,8 +355,9 @@ class JVPTrace(Trace):
     main = self.main
     def todo(x):
       primals, tangents = tree_unflatten(treedef, x)
+      avals = map(core.get_aval, primals)
       trace = JVPTrace(main, core.cur_sublevel())
-      return map(partial(JVPTracer, trace), primals, tangents)
+      return map(partial(JVPTracer, trace), avals, primals, tangents)
     if call_primitive.map_primitive:
       def out_axes_transform(out_axes):
         return (*out_axes, *(ax for ax, nz in zip(out_axes, tangents_nz) if nz))
@@ -359,8 +379,9 @@ class JVPTrace(Trace):
     tangents_in = map(replace_float0s, primals_in, tangents_in)
     outs = f_jvp.call_wrapped(*it.chain(primals_in, tangents_in))
     primals_out, tangents_out = split_list(outs, [len(outs) // 2])
+    avals = map(core.get_aval, primals_out)
     tangents_out = map(recast_to_float0, primals_out, tangents_out)
-    return map(partial(JVPTracer, self), primals_out, tangents_out)
+    return map(partial(JVPTracer, self), avals, primals_out, tangents_out)
 
   def post_process_custom_jvp_call(self, out_tracers, params):
     raise CustomJVPException()
@@ -378,7 +399,7 @@ class JVPTrace(Trace):
         avals_out=avals_out,
         x64_enabled=x64_enabled)
     tangents_out = map(recast_to_float0, primals_out, tangents_out)
-    return map(partial(JVPTracer, self), primals_out, tangents_out)
+    return map(partial(JVPTracer, self), avals_out, primals_out, tangents_out)
 
   def post_process_custom_vjp_call(self, out_tracers, params):
     raise CustomVJPException()
@@ -396,19 +417,19 @@ class JVPTrace(Trace):
 
 
 class JVPTracer(Tracer):
-  __slots__ = ['primal', 'tangent']
+  __slots__ = ['aval', 'primal', 'tangent']
 
-  def __init__(self, trace, primal, tangent):
+  def __init__(self, trace, aval, primal, tangent):
     if config.jax_enable_checks:
       _primal_tangent_shapes_match(primal, tangent)
     self._trace = trace
-    self.primal = primal
+    self.aval = aval
+    self.primal = core.convert_to_aval_dtype(primal, self.aval)
     self.tangent = tangent
-
-  @property
-  def aval(self):
-    # TODO(dougalm): add epsilon ball
-    return get_aval(self.primal)
+    if type(tangent) is not Zero and isinstance(aval, UnshapedArray):
+      tangent_aval = aval.update(
+          dtype=core.primal_dtype_to_tangent_dtype(self.aval.dtype))
+      self.tangent = core.convert_to_aval_dtype(self.tangent, tangent_aval)
 
   def full_lower(self):
     if type(self.tangent) is Zero:
@@ -719,4 +740,3 @@ class CustomVJPException(Exception):
            "with respect to explicit input parameters. Try passing the "
            "closed-over value into the custom_vjp function as an argument, and "
            "adapting the custom_vjp fwd and bwd rules.")
-    super().__init__(msg)

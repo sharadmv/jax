@@ -1328,11 +1328,11 @@ def _axis_index_bind(*, axis_name):
   if not isinstance(axis_name, (tuple, list)):
     return name_idx(axis_name)
   else:
-    inner_size = 1
-    index = 0
+    inner_size = np.int32(1)
+    index = np.int32(0)
     for name in reversed(axis_name):
       index += name_idx(name) * inner_size
-      inner_size *= psum(1, name)
+      inner_size *= np.int32(psum(1, name))
     return index
 axis_index_p.def_custom_bind(_axis_index_bind)
 

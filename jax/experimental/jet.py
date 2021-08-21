@@ -86,17 +86,15 @@ def traceable(in_tree_def, *primals_and_series):
 
 
 class JetTracer(core.Tracer):
-  __slots__ = ["primal", "terms"]
+  __slots__ = ["primal", "terms", "aval"]
 
   def __init__(self, trace, primal, terms):
     assert type(terms) in (ZeroSeries, list, tuple)
     self._trace = trace
     self.primal = primal
     self.terms = terms
-
-  @property
-  def aval(self):
-    return core.get_aval(self.primal)
+    self.aval = core.get_aval(self.primal)
+    self.primal = core.convert_to_aval_dtype(self.primal, self.aval)
 
   def full_lower(self):
     if self.terms is zero_series or all(t is zero_term for t in self.terms):

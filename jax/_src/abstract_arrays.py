@@ -50,7 +50,7 @@ array_types = {np.ndarray, np.bool_,
 
 def make_concrete_array(val, weak_type=False):
   dtype = dtypes.canonicalize_dtype(np.result_type(val))
-  return ConcreteArray(val.astype(dtype), weak_type=weak_type)
+  return ConcreteArray(val.astype(dtype), dtype, weak_type=weak_type)
 
 for t in array_types:
   core.pytype_aval_mappings[t] = make_concrete_array
@@ -62,8 +62,10 @@ def _zeros_like_python_scalar(t, x):
   return np.array(0, dtypes.python_scalar_dtypes[t])
 
 def _make_concrete_python_scalar(t, x):
+  dtype = dtypes._scalar_type_to_dtype(t, x)
   return ConcreteArray(
-    np.array(x, dtype=dtypes._scalar_type_to_dtype(t, x)),
+    np.array(x, dtype=dtype),
+    dtype,
     weak_type=True)
 
 for t in dtypes.python_scalar_dtypes:

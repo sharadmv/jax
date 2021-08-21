@@ -320,7 +320,7 @@ def _coo_todense_transpose(ct, data, row, col, *, shape):
   if ad.is_undefined_primal(row) or ad.is_undefined_primal(col):
     raise ValueError("Cannot transpose with respect to sparse indices")
   assert ct.shape == shape
-  assert row.aval.dtype == col.aval.dtype
+  assert row.dtype == col.dtype
   assert ct.dtype == data.aval.dtype
   return _coo_extract(row, col, ct), row, col
 

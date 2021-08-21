@@ -2112,6 +2112,7 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
                            key=operator.attrgetter('array_abstraction_level'))
   if least_specialized is ConcreteArray:
     return ConcreteArray(prim.impl(*[x.val for x in avals], **kwargs),
+                         dtype_rule(*avals, **kwargs),
                          weak_type=weak_type)
   elif least_specialized is ShapedArray:
     return ShapedArray(shape_rule(*avals, **kwargs), dtype_rule(*avals, **kwargs),
@@ -2132,7 +2133,7 @@ def standard_multi_result_abstract_eval(
   weak_types = weak_type_rule(*avals, **kwargs)
   if least_specialized is ConcreteArray:
     out_vals = prim.impl(*[x.val for x in avals], **kwargs)
-    return [ConcreteArray(val, weak_type=weak_type)
+    return [ConcreteArray(val, dtype_rule(*avals, **kwargs), weak_type=weak_type)
             for val, weak_type in safe_zip(out_vals, weak_types)]
   elif least_specialized is ShapedArray:
     out_shapes = shape_rule(*avals, **kwargs)
@@ -2895,7 +2896,7 @@ def _convert_element_type_transpose_rule(ct, operand, *, new_dtype, weak_type):
   old_weak_type = dtypes.is_weakly_typed(operand)
   if type(ct) is ad_util.Zero:
     return [ad_util.Zero(operand.aval)]
-  elif core.primal_dtype_to_tangent_dtype(old_dtype) is dtypes.float0:
+  elif core.primal_dtype_to_tangent_dtype(old_dtype) is dtypes.float0 and old_dtype != new_dtype:
     return [ad_util.Zero(operand.aval.update(dtype=dtypes.float0, weak_type=False))]
   else:
     return [convert_element_type_p.bind(ct, new_dtype=old_dtype,

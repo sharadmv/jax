@@ -151,6 +151,7 @@ class BatchTrace(Trace):
 
   def process_call(self, call_primitive, f: lu.WrappedFun, tracers, params):
     assert call_primitive.multiple_results
+    print('process call', call_primitive)
     params = dict(params, name=wrap_name(params.get('name', f.__name__), 'vmap'))
     vals, dims = unzip2((t.val, t.batch_dim) for t in tracers)
     if all(bdim is not_mapped for bdim in dims):
@@ -161,6 +162,7 @@ class BatchTrace(Trace):
       return [BatchTracer(self, v, d) for v, d in zip(vals_out, dims_out())]
 
   def post_process_call(self, call_primitive, out_tracers, params):
+    print('pp call')
     vals, dims = unzip2((t.val, t.batch_dim) for t in out_tracers)
     main = self.main
     def todo(vals):

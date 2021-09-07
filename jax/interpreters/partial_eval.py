@@ -1286,9 +1286,12 @@ class DynamicJaxprTrace(core.Trace):
     return out_tracers if primitive.multiple_results else out_tracers.pop()
 
   def process_call(self, call_primitive, f, tracers, params):
+    print('jaxpr process_call', call_primitive, params)
     in_avals = [t.aval for t in tracers]
     with core.new_sublevel():
+      print('tracing')
       jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(f, self.main, in_avals)
+    print('done')
     if params.get('inline', False):
       return core.eval_jaxpr(jaxpr, consts, *tracers)
     source_info = source_info_util.current()
@@ -1302,10 +1305,12 @@ class DynamicJaxprTrace(core.Trace):
       new_params = update_params(new_params, [True] * len(tracers))
     eqn = new_jaxpr_eqn([*constvars, *invars], outvars, call_primitive,
                         new_params, source_info)
+    print('done process call', eqn)
     self.frame.eqns.append(eqn)
     return out_tracers
 
   def post_process_call(self, call_primitive, out_tracers, params):
+    print('false')
     assert False  # unreachable
 
   def process_map(self, map_primitive, f, tracers, params):

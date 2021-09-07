@@ -1,31 +1,3 @@
-# ---
-# Copyright 2021 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# jupyter:
-#   jupytext:
-#     formats: ipynb,md:myst,py
-#     text_representation:
-#       extension: .py
-#       format_name: light
-#       format_version: '1.5'
-#       jupytext_version: 1.10.0
-#   kernelspec:
-#     display_name: Python 3
-#     name: python3
-# ---
-
 # [![Open in
 # Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/google/jax/blob/main/docs/autodidax.ipynb)
 
@@ -2871,3 +2843,790 @@ def pprint_cond(names: DefaultDict[Var, str], eqn: JaxprEqn) -> PPrint:
                pp_jaxpr(true_jaxpr).indent(2),
                pp_jaxpr(false_jaxpr).indent(2)])
 pp_rules[cond_p] = pprint_cond
+
+# -
+
+# # Part 6: Adding a named scope context manager
+
+
+# With a named scope context manager (as opposed to a transformation), we need
+# to be careful about how we 1. keep track of named scopes and 2. propagate them
+# through transformations. In this initial attempt, we'll keep track of named
+# scopes at the lowest level, a.k.a. jaxprs. If we use a named scope inside of a
+# function, we'll need to keep track of the ops that correspond to that name
+# scope, meaning a jaxpr equation may have its own name scope. At the same time,
+# we might wrap a JIT-ted or transformed function call in its own name scope. We
+# will thus need to keep track of name scopes at the jaxpr level.
+
+# ## `named_scope`
+
+# +
+class Scope(NamedTuple):
+  name: str
+
+  def wrap(self, stack: Tuple[str, ...]) -> Tuple[str, ...]:
+    return (self.name, *stack)
+
+
+class Transform(NamedTuple):
+  name: str
+
+  def wrap(self, stack: Tuple[str, ...]) -> Tuple[str, ...]:
+    return tuple(map(lambda x: f'{self.name}({x})', stack))
+
+
+class NameScope(NamedTuple):
+  name_stack: Tuple[Union[Scope, Transform], ...] = ()
+ 
+  def extend(self, name: Union[Tuple[str, ...], str]) -> 'NameScope':
+    if not isinstance(name, tuple):
+      name = (name,)
+    scopes = tuple(map(Scope, name))
+    return NameScope(self.name_stack + scopes)
+
+  def wrap_name(self, name: str) -> str:
+    if not self.name_stack:
+      return name
+    return f'{str(self)}/{name}'
+
+  def transform(self, transform_name: str) -> 'NameScope':
+    return NameScope((*self.name_stack, Transform(transform_name)))
+
+  def __add__(self, other: 'NameScope') -> 'NameScope':
+    return NameScope(self.name_stack + other.name_stack)
+
+  def __radd__(self, other: 'NameScope') -> 'NameScope':
+    return NameScope(other.name_stack + self.name_stack)
+
+  def __str__(self) -> str:
+    scope: Tuple[str, ...] = ()
+    for elem in self.name_stack[::-1]:
+      scope = elem.wrap(scope)
+    return '/'.join(scope)
+
+
+import contextlib
+
+name_scope_stack: List[NameScope] = [NameScope()]
+
+@contextlib.contextmanager
+def name_scope(scope: Union[str, Tuple[str, ...]]) -> Iterator[NameScope]:
+  current_scope = get_current_scope()
+  new_scope = current_scope.extend(scope)
+  name_scope_stack.append(new_scope)
+  yield new_scope
+  name_scope_stack.pop()
+
+@contextlib.contextmanager
+def set_scope(scope: NameScope) -> Iterator[NameScope]:
+  name_scope_stack.append(scope)
+  yield scope 
+  name_scope_stack.pop()
+
+@contextlib.contextmanager
+def disable_name_scope() -> Iterator[None]:
+  with set_scope(NameScope()):
+    yield
+
+
+@contextlib.contextmanager
+def transform_scope(transform_name: str) -> Iterator[NameScope]:
+  current_scope = get_current_scope()
+  new_scope = current_scope.transform(transform_name)
+  name_scope_stack.append(new_scope)
+  yield new_scope
+  name_scope_stack.pop()
+
+
+def get_current_scope() -> NameScope:
+  return name_scope_stack[-1]
+
+
+# -
+
+# ## `xla_computation`
+
+def xla_computation(f):
+  def xla_computation_maker(*args) -> xe.XlaComputation:
+    avals_in = [raise_to_shaped(get_aval(x)) for x in args]
+    jaxpr, consts, _ = make_jaxpr(f, *avals_in)
+    c = xb.make_computation_builder(f'xla_computation_{f.__name__}')
+    xla_consts = map(partial(xb.constant, c), consts)
+    xla_consts = _xla_consts(c, consts)
+    xla_params = _xla_params(c, avals_in)
+    out_nodes = jaxpr_subcomp(c, jaxpr, xla_consts + xla_params, get_current_scope())
+    out_tuple = xc.ops.Tuple(c, out_nodes)
+    built = c.build(out_tuple)
+    return built
+  return xla_computation_maker
+
+# +
+class JaxprEqn(NamedTuple):
+  primitive: Primitive
+  inputs: List[Atom]
+  params: Dict[str, Any]
+  out_binders: List[Var]
+  scope: NameScope
+
+
+def pp_jaxpr(jaxpr: Jaxpr) -> PPrint:
+  namegen = (''.join(s) for r in it.count(1)
+             for s in it.permutations(string.ascii_lowercase, r))
+  names = defaultdict(lambda: next(namegen))
+  in_binders = ', '.join(var_str(names, x) for x in jaxpr.in_binders)
+  eqns = vcat([pp_eqn(names, e) for e in jaxpr.eqns])
+  outs = ', '.join(names[v] if isinstance(v, Var) else str(v.val)
+                   for v in jaxpr.outs)
+  return (pp(f'{{ lambda {in_binders} .') +
+          ((pp('let ') >> eqns) + pp(f'in ( {outs} ) }}')).indent(2))
+
+
+def pp_eqn(names: DefaultDict[Var, str], eqn: JaxprEqn) -> PPrint:
+  rule = pp_rules.get(eqn.primitive)
+  if rule:
+    return rule(names, eqn)
+  else:
+    lhs = pp(' '.join(var_str(names, v) for v in eqn.out_binders))
+    rhs = (pp(eqn.primitive.name) >> pp_params(eqn.params) >>
+           pp(' '.join(names[x] if isinstance(x, Var) else str(x.val)
+                       for x in eqn.inputs)) >> pp(' (') >> pp(eqn.scope) >> pp(')'))
+    return lhs >> pp(' = ') >> rhs
+
+def pprint_xla_call(names: DefaultDict[Var, str], eqn: JaxprEqn) -> PPrint:
+  lhs = pp(' '.join(var_str(names, v) for v in eqn.out_binders))
+  params_without_jaxpr = {k:v for k, v in eqn.params.items() if k != 'jaxpr'}
+  rhs = (pp(eqn.primitive.name) >> pp_params(params_without_jaxpr) >>
+         pp(' '.join(names[x] if isinstance(x, Var) else str(x.val)
+                     for x in eqn.inputs)))
+  return vcat([lhs >> pp(' = ') >> rhs >> pp(' (') >> pp(eqn.scope) >> pp(')'),
+               pp_jaxpr(eqn.params['jaxpr']).indent(2)])
+pp_rules[xla_call_p] = pprint_xla_call
+
+_JaxprBuilder = JaxprBuilder
+
+def _inline_literals(jaxpr: Jaxpr, consts: List[Any]) -> Tuple[Jaxpr, List[Any]]:
+  const_binders, other_binders = split_list(jaxpr.in_binders, len(consts))
+  scalars = [type(x) in jax_types and not get_aval(x).shape for x in consts]
+  new_const_binders, lit_binders = partition_list(scalars, const_binders)
+  new_consts, lit_vals = partition_list(scalars, consts)
+  literals = dict(zip(lit_binders, map(Lit, lit_vals)))
+  new_eqns = [JaxprEqn(eqn.primitive, [literals.get(x, x) for x in eqn.inputs],
+                       eqn.params, eqn.out_binders, eqn.scope) for eqn in jaxpr.eqns]
+  new_outs = [literals.get(x, x) for x in jaxpr.outs]
+  new_jaxpr = Jaxpr(new_const_binders + other_binders, new_eqns, new_outs)
+  typecheck_jaxpr(new_jaxpr)
+  return new_jaxpr, new_consts
+
+class JaxprBuilder(_JaxprBuilder):
+  eqns: List[JaxprEqn]
+  tracer_to_var: Dict[int, Var]
+  const_tracers: Dict[int, JaxprTracer]
+  constvals: Dict[Var, Any]
+  tracers: List[JaxprTracer]
+
+  def build(self, in_tracers: List[JaxprTracer], out_tracers: List[JaxprTracer]
+            ) -> Tuple[Jaxpr, List[Any]]:
+    constvars, constvals = unzip2(self.constvals.items())
+    t2v = lambda t: self.tracer_to_var[id(t)]
+    in_binders = constvars + [t2v(t) for t in in_tracers]
+    out_vars = [t2v(t) for t in out_tracers]
+    jaxpr = Jaxpr(in_binders, self.eqns, out_vars)
+    typecheck_jaxpr(jaxpr)
+    jaxpr, constvals = _inline_literals(jaxpr, constvals)
+    return jaxpr, constvals
+
+# NB: the analogous class in JAX is called 'DynamicJaxprTrace'
+_JaxprTrace = JaxprTrace
+class JaxprTrace(_JaxprTrace):
+
+  def process_primitive(self, primitive, tracers, params):
+    avals_in = [t.aval for t in tracers]
+    avals_out = abstract_eval_rules[primitive](*avals_in, **params)
+    out_tracers = [self.builder.new_tracer(self, a) for a in avals_out]
+    inputs = [self.builder.getvar(t) for t in tracers]
+    outvars = [self.builder.add_var(t) for t in out_tracers]
+    current_scope = get_current_scope()
+    self.builder.add_eqn(JaxprEqn(
+      primitive, inputs, params, outvars, current_scope))
+    return out_tracers
+
+@lru_cache()
+def make_jaxpr(f: Callable, *avals_in: ShapedArray,
+               ) -> Tuple[Jaxpr, List[Any], PyTreeDef]:
+  avals_in, in_tree = tree_flatten(avals_in)
+  f, out_tree = flatten_fun(f, in_tree)
+
+  builder = JaxprBuilder()
+  with new_main(JaxprTrace, builder) as main:
+    with new_dynamic(main):
+      trace = JaxprTrace(main)
+      tracers_in = [trace.new_arg(aval) for aval in avals_in]
+      with disable_name_scope():
+        outs = f(*tracers_in)
+      tracers_out = [full_raise(trace, out) for out in outs]
+      jaxpr, consts = builder.build(tracers_in, tracers_out)
+  return jaxpr, consts, out_tree()
+
+# -
+
+# +
+def xla_call_translation(c, in_avals, in_vals, scope, *, jaxpr, num_consts):
+  del num_consts  # Only used at top-level.
+  # Calling jaxpr_subcomp directly would inline. We generate a Call HLO instead.
+  computation_name = scope.wrap_name('inner_xla_call')
+  subc = xb.make_computation_builder(computation_name)
+  xla_params = _xla_params(subc, in_avals)
+  outs = jaxpr_subcomp(subc, jaxpr, xla_params, scope)
+  subc = subc.build(xops.Tuple(subc, outs))
+  return destructure_tuple(c, xops.Call(c, subc, in_vals))
+xla_translations[xla_call_p] = xla_call_translation
+# -
+
+# +
+def make_op_metadata(primitive: Primitive,
+                     scope: NameScope,
+                     **params: Any) -> xc.OpMetadata:
+  del params
+  op_name = scope.wrap_name(str(pp(primitive.name)))
+  return xc.OpMetadata(
+        op_type=primitive.name,
+        op_name=op_name)
+
+
+def jaxpr_subcomp(c: xe.XlaBuilder, jaxpr: Jaxpr, args: List[xe.XlaOp],
+    parent_scope: NameScope) -> xe.XlaOp:
+  env: Dict[Var, xe.XlaOp] = {}
+
+  def read(x: Atom) -> xe.XlaOp:
+    return env[x] if type(x) is Var else xb.constant(c, x.val, False)
+
+  def write(v: Var, val: xe.XlaOp) -> None:
+    env[v] = val
+
+  map(write, jaxpr.in_binders, args)
+  for eqn in jaxpr.eqns:
+    in_avals = [x.aval for x in eqn.inputs]
+    in_vals = map(read, eqn.inputs)
+    rule = xla_translations[eqn.primitive]
+    out_vals = rule(c, in_avals, in_vals, parent_scope + eqn.scope, **eqn.params)
+    map(write, eqn.out_binders, out_vals)
+  return map(read, jaxpr.outs)
+
+
+# +
+def direct_translation(op, prim, c, in_avals, in_vals, scope):
+  del in_avals
+  metadata = make_op_metadata(prim, scope)
+  c.set_op_metadata(metadata)
+  return [op(*in_vals)]
+
+xla_translations[add_p] = partial(direct_translation, xops.Add, add_p)
+xla_translations[mul_p] = partial(direct_translation, xops.Mul, mul_p)
+xla_translations[neg_p] = partial(direct_translation, xops.Neg, neg_p)
+xla_translations[sin_p] = partial(direct_translation, xops.Sin, sin_p)
+xla_translations[cos_p] = partial(direct_translation, xops.Cos, cos_p)
+xla_translations[greater_p] = partial(direct_translation, xops.Gt, greater_p)
+xla_translations[less_p] = partial(direct_translation, xops.Lt, less_p)
+
+def reduce_sum_translation(c, in_avals, in_vals, scope, *, axis):
+  c.set_op_metadata(make_op_metadata(reduce_sum_p, scope, axis=axis))
+  (x_aval,), (x,) = in_avals, in_vals
+  zero = xops.ConstantLiteral(c, np.array(0, x_aval.dtype))
+  subc = xb.make_computation_builder('add')
+  shape = _xla_shape(ShapedArray((), x_aval.dtype))
+  xops.Add(xops.Parameter(subc, 0, shape), xops.Parameter(subc, 1, shape))
+  return [xops.Reduce(c, [x], [zero], subc.build(), [axis])]
+xla_translations[reduce_sum_p] = reduce_sum_translation
+
+def broadcast_translation(c, in_avals, in_vals, scope, *, shape, axes):
+  c.set_op_metadata(make_op_metadata(broadcast_p, scope, shape=shape, axes=axes))
+  x, = in_vals
+  dims_complement = [i for i in range(len(shape)) if i not in axes]
+  return [xops.BroadcastInDim(x, shape, dims_complement)]
+xla_translations[broadcast_p] = broadcast_translation
+
+# -
+def get_hlo(c, optimize=False, metadata=False, platform=None):
+  print_opts = xc._xla.HloPrintOptions.short_parsable()
+  print_opts.print_metadata = metadata
+  client = xb.get_backend(platform)
+  if optimize:
+    return client.compile(c).hlo_modules()[0].to_string(print_opts)
+  return c.as_hlo_module().to_string(print_opts)
+
+@jit
+def f(x):
+  with name_scope('foo'):
+    y = x + np.ones((5, 2))
+    with name_scope('bar'):
+      with name_scope('baz'):
+        z = y + np.ones((5, 2))
+  return z
+
+print(str(pp_jaxpr(make_jaxpr(f, get_aval(np.ones((5, 2))))[0])))
+print(get_hlo(xla_computation(f)(np.ones((5, 2))), metadata=True, optimize=False))
+
+@name_scope('foo')
+@jit
+def f(x):
+  y = x + np.ones((5, 2))
+  with name_scope('bar'):
+    with name_scope('baz'):
+      z = y + np.ones((5, 2))
+  return z
+print(str(pp_jaxpr(make_jaxpr(f, get_aval(np.ones((5, 2))))[0])))
+print(get_hlo(xla_computation(f)(np.ones((5, 2))), metadata=True, optimize=False))
+
+
+# ## Transformations
+
+# ### JVP
+
+def eval_jaxpr(jaxpr: Jaxpr, args: List[Any]) -> List[Any]:
+  env: Dict[Var, Any] = {}
+
+  def read(x: Atom) -> Any:
+    return env[x] if type(x) is Var else x.val
+
+  def write(v: Var, val: Any) -> None:
+    assert v not in env  # single-assignment
+    env[v] = val
+
+  map(write, jaxpr.in_binders, args)
+  for eqn in jaxpr.eqns:
+    in_vals = map(read, eqn.inputs)
+    with set_scope(get_current_scope() + eqn.scope):
+      outs = bind(eqn.primitive, *in_vals, **eqn.params)
+    map(write, eqn.out_binders, outs)
+  return map(read, jaxpr.outs)
+
+@name_scope('foo')
+@jit
+def f(x):
+  y = x + np.ones((5, 2))
+  with name_scope('bar'):
+    with name_scope('baz'):
+      z = y + np.ones((5, 2))
+  return z
+
+def jvp_flat(f, primals, tangents):
+  with new_main(JVPTrace) as main:
+    trace = JVPTrace(main)
+    tracers_in = [JVPTracer(trace, x, t) for x, t in zip(primals, tangents)]
+    with transform_scope('jvp'):
+      outs = f(*tracers_in)
+    tracers_out = [full_raise(trace, out) for out in outs]
+    primals_out, tangents_out = unzip2((t.primal, t.tangent) for t in tracers_out)
+  return primals_out, tangents_out
+
+print(pp_jaxpr(
+make_jaxpr(lambda x, t: jvp(f, (x,), (t,)), get_aval(np.ones((5, 2))),
+get_aval(np.ones((5, 2))))[0]))
+
+
+print(get_hlo(
+xla_computation(lambda x, t: jvp(f, (x,), (t,)))(np.ones((5, 2)),
+np.ones((5, 2))), metadata=True))
+
+# ### `vmap`
+
+def vmap_flat(f, in_axes, *args):
+  axis_size, = {x.shape[ax] for x, ax in zip(args, in_axes)
+                if ax is not not_mapped}
+  with new_main(BatchTrace, axis_size) as main:
+    trace = BatchTrace(main)
+    tracers_in = [BatchTracer(trace, x, ax) if ax is not None else x
+                  for x, ax in zip(args, in_axes)]
+    with transform_scope('vmap'):
+      outs = f(*tracers_in)
+    tracers_out = [full_raise(trace, out) for out in outs]
+    vals_out, bdims_out = unzip2((t.val, t.batch_dim) for t in tracers_out)
+  outs_transposed = [move_batch_axis(axis_size, bdim, 0, val_out)
+                     for val_out, bdim in zip(vals_out, bdims_out)]
+  return outs_transposed
+
+@name_scope('foo')
+@jit
+def f(x):
+  y = x + np.ones((5, 2))
+  with name_scope('bar'):
+    with name_scope('baz'):
+      z = y + np.ones((5, 2))
+  return z
+
+print(pp_jaxpr(make_jaxpr(vmap(f, (0,)), get_aval(np.ones((3, 5, 2))))[0]))
+
+# ### Partial eval / VJP
+
+@transform_scope('transpose')
+def eval_jaxpr_transposed(jaxpr: Jaxpr, args: List[Any], cotangents: List[Any]
+                          ) -> List[Any]:
+  primal_env: Dict[Var, Any] = {}
+  ct_env: Dict[Var, Any] = {}
+
+  def read_primal(x: Atom) -> Any:
+    return primal_env.get(x, UndefPrimal(x.aval)) if type(x) is Var else x.val
+
+  def write_primal(v: Var, val: Any) -> None:
+    if type(val) is not UndefPrimal:
+      primal_env[v] = val
+
+  def read_cotangent(v: Var) -> Any:
+    return ct_env.pop(v, np.zeros(v.aval.shape, v.aval.dtype))
+
+  def write_cotangent(x: Atom, val: Any):
+    if type(x) is Var and val is not None:
+      ct_env[x] = add(ct_env[x], val) if x in ct_env else val
+
+  map(write_primal, jaxpr.in_binders, args)
+  map(write_cotangent, jaxpr.outs, cotangents)
+  for eqn in jaxpr.eqns[::-1]:
+    primals_in = map(read_primal, eqn.inputs)
+    cts_in = map(read_cotangent, eqn.out_binders)
+    rule = transpose_rules[eqn.primitive]
+    with set_scope(get_current_scope() + eqn.scope):
+      cts_out = rule(cts_in, *primals_in, **eqn.params)
+      map(write_cotangent, eqn.inputs, cts_out)
+
+  return [read_cotangent(v) for v, x in zip(jaxpr.in_binders, args)
+          if type(x) is UndefPrimal]
+
+
+# +
+class JaxprEqnRecipe(NamedTuple):
+  prim: Primitive
+  tracers_in: List['PartialEvalTracer']
+  params: Dict[str, Any]
+  avals_out: List[ShapedArray]
+  tracer_refs_out: List['ReferenceType[PartialEvalTracer]']
+  scope: NameScope
+
+JaxprRecipe = Union[LambdaBindingRecipe, ConstRecipe, JaxprEqnRecipe]
+
+def partial_eval_flat(f: Callable, pvals_in: List[PartialVal]
+                      ) -> Tuple[Jaxpr, List[PartialVal], List[Any]]:
+  current_scope = get_current_scope()
+  with new_main(PartialEvalTrace, current_scope) as main:
+    trace = PartialEvalTrace(main)
+    tracers_in = [trace.new_arg(pval) for pval in pvals_in]
+    with disable_name_scope():
+      outs = f(*tracers_in)
+    tracers_out = [full_raise(trace, out) for out in outs]
+    pvals_out = [t.pval for t in tracers_out]
+    unk_tracers_in  = [t for t in tracers_in  if t.pval.is_unknown]
+    unk_tracers_out = [t for t in tracers_out if t.pval.is_unknown]
+    jaxpr, consts = tracers_to_jaxpr(unk_tracers_in, unk_tracers_out)
+  return jaxpr, pvals_out, consts
+
+_PartialEvalTrace = PartialEvalTrace
+class PartialEvalTrace(_PartialEvalTrace):
+
+  def process_primitive(self, primitive, tracers, params):
+    if all(t.pval.is_known for t in tracers):
+      with set_scope(self.scope + get_current_scope()):
+        return bind(primitive, *map(full_lower, tracers), **params)
+    rule = partial_eval_rules.get(primitive)
+    if rule: return rule(self, tracers, **params)
+    tracers_in = [self.instantiate_const(t) for t in tracers]
+    avals_in = [t.aval for t in tracers_in]
+    avals_out = abstract_eval_rules[primitive](*avals_in, **params)
+    tracers_out = [PartialEvalTracer(self, PartialVal.unknown(aval), None)
+                   for aval in avals_out]
+    eqn = JaxprEqnRecipe(primitive, tracers_in, params, avals_out,
+                         map(ref, tracers_out), get_current_scope())
+    for t in tracers_out: t.recipe = eqn
+    return tracers_out
+
+  @property
+  def scope(self) -> NameScope:
+    return self.main.global_data
+
+def recipe_to_eqn(tracer_to_var: Dict[int, Var], recipe: JaxprEqnRecipe
+                  ) -> JaxprEqn:
+  inputs = [tracer_to_var[id(t)] for t in recipe.tracers_in]
+  out_binders = [Var(aval) for aval in recipe.avals_out]
+  for t_ref, var in zip(recipe.tracer_refs_out, out_binders):
+    if t_ref() is not None: tracer_to_var[id(t_ref())] = var
+  return JaxprEqn(recipe.prim, inputs, recipe.params, out_binders, recipe.scope)
+
+def xla_call_partial_eval(trace, tracers, *, jaxpr, num_consts):
+  del num_consts  # Unused
+  in_unknowns = [not t.pval.is_known for t in tracers]
+  jaxpr1, jaxpr2, out_unknowns, num_res = partial_eval_jaxpr(jaxpr, in_unknowns)
+  known_tracers, unknown_tracers = partition_list(in_unknowns, tracers)
+  known_vals = [t.pval.const for t in known_tracers]
+  with set_scope(trace.scope + get_current_scope()):
+    outs1_res = bind(xla_call_p, *known_vals, jaxpr=jaxpr1, num_consts=0)
+  outs1, res = split_list(outs1_res, len(jaxpr1.outs) - num_res)
+  res_tracers = [trace.instantiate_const(full_raise(trace, x)) for x in res]
+  outs2 = [PartialEvalTracer(trace, PartialVal.unknown(v.aval), None)
+           for v in jaxpr2.outs]
+  eqn = JaxprEqnRecipe(xla_call_p, res_tracers + unknown_tracers,
+                       dict(jaxpr=jaxpr2, num_consts=0),
+                       [v.aval for v in jaxpr2.outs], map(ref, outs2),
+                       get_current_scope())
+  for t in outs2: t.recipe = eqn
+  return merge_lists(out_unknowns, outs1, outs2)
+partial_eval_rules[xla_call_p] = xla_call_partial_eval
+
+def partial_eval_jaxpr(jaxpr: Jaxpr, in_unknowns: List[bool],
+                       instantiate: Optional[List[bool]] = None,
+                       ) -> Tuple[Jaxpr, Jaxpr, List[bool], int]:
+  env: Dict[Var, bool] = {}
+  residuals: Set[Var] = set()
+
+  def read(x: Atom) -> bool:
+    return type(x) is Var and env[x]
+
+  def write(unk: bool, v: Var) -> None:
+    env[v] = unk
+
+  def new_res(x: Atom) -> Atom:
+    if type(x) is Var: residuals.add(x)
+    return x
+
+  eqns1, eqns2 = [], []
+  map(write, in_unknowns, jaxpr.in_binders)
+  for eqn in jaxpr.eqns:
+    unks_in = map(read, eqn.inputs)
+    rule = partial_eval_jaxpr_rules.get(eqn.primitive)
+    if rule:
+      eqn1, eqn2, unks_out, res = rule(unks_in, eqn)
+      eqns1.append(eqn1); eqns2.append(eqn2); residuals.update(res)
+      map(write, unks_out, eqn.out_binders)
+    elif any(unks_in):
+      inputs = [v if unk else new_res(v) for unk, v in zip(unks_in, eqn.inputs)]
+      eqns2.append(JaxprEqn(eqn.primitive, inputs, eqn.params, eqn.out_binders,
+            eqn.scope))
+      map(partial(write, True), eqn.out_binders)
+    else:
+      eqns1.append(eqn)
+      map(partial(write, False), eqn.out_binders)
+  out_unknowns = map(read, jaxpr.outs)
+  if instantiate is not None:
+    for v, uk, inst in zip(jaxpr.outs, out_unknowns, instantiate):
+      if inst and not uk: new_res(v)
+    out_unknowns = map(op.or_, out_unknowns, instantiate)
+
+  residuals, num_res = list(residuals), len(residuals)
+  assert all(type(v) is Var for v in residuals), residuals
+
+  ins1, ins2 = partition_list(in_unknowns, jaxpr.in_binders)
+  outs1, outs2 = partition_list(out_unknowns, jaxpr.outs)
+
+  jaxpr1 = Jaxpr(ins1, eqns1, outs1 + residuals)
+  jaxpr2 = Jaxpr(residuals + ins2, eqns2, outs2)
+  typecheck_partial_eval_jaxpr(jaxpr, in_unknowns, out_unknowns, jaxpr1, jaxpr2)
+
+  return jaxpr1, jaxpr2, out_unknowns, num_res
+# -
+
+# +
+def reduce_sum_transpose_rule(cts, val, *, axis):
+  ct, = cts
+  assert type(val) is UndefPrimal
+  return [broadcast(ct, val.aval.shape, (axis,))]
+transpose_rules[reduce_sum_p] = reduce_sum_transpose_rule
+
+def broadcast_batching_rule(axis_size, vals_in, dims_in, *, shape, axes):
+  operand, = vals_in 
+  bdim, = dims_in
+  if bdim is not_mapped:
+    return [broadcast(operand, shape, axes)], [not_mapped]
+  new_operand = moveaxis(operand, bdim, 0)
+  new_shape = (axis_size,) + shape
+  new_axes = tuple(np.add(1, axes))
+  return [broadcast(new_operand, new_shape, new_axes)], [0]
+vmap_rules[broadcast_p] = broadcast_batching_rule
+# -
+
+# +
+@jit
+def f(x):
+  with name_scope('foo'):
+    y = x * np.ones((5, 2)) * x
+    with name_scope('bar'):
+      with name_scope('baz'):
+        z = y + np.ones((5, 2))
+        return reduce_sum(reduce_sum(z, 0), 0)
+
+print(pp_jaxpr(
+make_jaxpr(lambda x: vmap(grad(f), (0,))(x), get_aval(np.ones((3, 5, 2))))[0]))
+
+print(get_hlo(
+xla_computation(lambda x: vmap(grad(f), (0,))(x))(np.ones((3, 5, 2))),
+metadata=True))
+# -
+
+# +
+@name_scope('foo')
+def f(x):
+  with name_scope('bar'):
+    y = x * np.ones((5, 2)) * x
+  with name_scope('baz'):
+    z = y + np.ones((5, 2))
+    return reduce_sum(reduce_sum(z, 0), 0)
+
+print(pp_jaxpr(
+make_jaxpr(lambda x: vmap(grad(f), (0,))(x), get_aval(np.ones((3, 5, 2))))[0]))
+
+print(get_hlo(
+xla_computation(lambda x: vmap(grad(f), (0,))(x))(np.ones((3, 5, 2))),
+metadata=True))
+# -
+
+# +
+
+@name_scope('foo')
+@jit
+def f(x):
+  return sin(x)
+
+print(pp_jaxpr(
+make_jaxpr(lambda x: vmap(grad(f), (0,))(x), get_aval(np.ones((2))))[0]))
+
+print(get_hlo(
+xla_computation(lambda x: vmap(grad(f), (0,))(x))(np.ones((2))),
+metadata=True))
+# -
+
+# ### Cond
+
+# + tags=["hide-input"]
+
+@lru_cache()
+def xla_callable(hashable_jaxpr: IDHashable, hashable_consts: Tuple[IDHashable]):
+  jaxpr: Jaxpr = hashable_jaxpr.val
+  typecheck_jaxpr(jaxpr)
+  consts = [x.val for x in hashable_consts]
+  in_avals = [v.aval for v in jaxpr.in_binders[len(consts):]]
+  c = xb.make_computation_builder('xla_call')
+  xla_consts = _xla_consts(c, consts)
+  xla_params = _xla_params(c, in_avals)
+  outs = jaxpr_subcomp(c, jaxpr, xla_consts + xla_params, NameScope())
+  out = xops.Tuple(c, outs)
+  compiled = xb.get_backend(None).compile(c.build(out))
+  return partial(execute_compiled, compiled, [v.aval for v in jaxpr.outs])
+
+def pprint_cond(names: DefaultDict[Var, str], eqn: JaxprEqn) -> PPrint:
+  true_jaxpr, false_jaxpr = eqn.params['true_jaxpr'], eqn.params['false_jaxpr']
+  new_params = {k:v for k, v in eqn.params.items() if not k.endswith('jaxpr')}
+  lhs = pp(' '.join(var_str(names, v) for v in eqn.out_binders))
+  rhs = (pp(eqn.primitive.name) >> pp_params(new_params) >>
+         pp(' '.join(names[x] if isinstance(x, Var) else str(x.val)
+                     for x in eqn.inputs)) >> pp(' (') >> pp(eqn.scope) >> pp(')'))
+  return vcat([lhs >> pp(' = ') >> rhs,
+               pp_jaxpr(true_jaxpr).indent(2),
+               pp_jaxpr(false_jaxpr).indent(2)])
+pp_rules[cond_p] = pprint_cond
+
+def cond_translation(c, in_avals, in_vals, scope, *, true_jaxpr, false_jaxpr):
+  del in_avals  # Unused
+  pred, *in_vals = in_vals
+  flat_vals, in_tree = tree_flatten(in_vals)
+  operand = xops.Tuple(c, flat_vals)
+  operand_shape = c.get_shape(operand)
+
+  def make_comp(name: str, jaxpr: Jaxpr) -> xe.XlaComputation:
+    c = xb.make_computation_builder(name)
+    operand = xb.parameter(c, 0, operand_shape)
+    operands = tree_unflatten(in_tree, destructure_tuple(c, operand))
+    outs = jaxpr_subcomp(c, jaxpr, operands, scope)
+    return c.build(xops.Tuple(c, outs))
+
+  true_comp = make_comp('true_fn', true_jaxpr)
+  false_comp = make_comp('false_fn', false_jaxpr)
+
+  int_etype = xc.dtype_to_etype(np.dtype('int32'))
+  out = xops.Conditional(xops.ConvertElementType(pred, int_etype),
+                         [false_comp, true_comp], [operand] * 2)
+  return destructure_tuple(c, out)
+xla_translations[cond_p] = cond_translation
+
+def cond_partial_eval(trace, tracers, *, true_jaxpr, false_jaxpr):
+  pred_tracer, *tracers = tracers
+  assert pred_tracer.pval.is_known
+  pred = pred_tracer.pval.const
+  in_uks = [not t.pval.is_known for t in tracers]
+
+  *jaxprs, out_uks, num_res = _cond_partial_eval(true_jaxpr, false_jaxpr, in_uks)
+  t_jaxpr1, f_jaxpr1, t_jaxpr2, f_jaxpr2 = jaxprs
+
+  known_tracers, unknown_tracers = partition_list(in_uks, tracers)
+  known_vals = [t.pval.const for t in known_tracers]
+  with set_scope(trace.scope + get_current_scope()):
+    outs1_res = bind_cond(pred, *known_vals,
+                          true_jaxpr=t_jaxpr1, false_jaxpr=f_jaxpr1)
+  outs1, res = split_list(outs1_res, len(outs1_res) - num_res)
+  pred_tracer_ = trace.instantiate_const(full_raise(trace, pred_tracer))
+  res_tracers = [trace.instantiate_const(full_raise(trace, x)) for x in res]
+  outs2 = [PartialEvalTracer(trace, PartialVal.unknown(v.aval), None)
+           for v in t_jaxpr2.outs]
+  eqn = JaxprEqnRecipe(cond_p, [pred_tracer_, *res_tracers, *unknown_tracers],
+                       dict(true_jaxpr=t_jaxpr2, false_jaxpr=f_jaxpr2),
+                       [v.aval for v in t_jaxpr2.outs], map(ref, outs2),
+                       get_current_scope())
+  for t in outs2: t.recipe = eqn
+  return merge_lists(out_uks, outs1, outs2)
+partial_eval_rules[cond_p] = cond_partial_eval
+
+def cond(pred, true_fn, false_fn, *operands):
+  avals_in = [raise_to_shaped(get_aval(x)) for x in operands]
+  true_jaxpr, true_consts, out_tree = make_jaxpr(true_fn, *avals_in)
+  false_jaxpr, false_consts, out_tree_ = make_jaxpr(false_fn, *avals_in)
+  if out_tree != out_tree_: raise TypeError
+  true_jaxpr, false_jaxpr = _join_jaxpr_consts(
+      true_jaxpr, false_jaxpr, len(true_consts), len(false_consts))
+  if typecheck_jaxpr(true_jaxpr) != typecheck_jaxpr(false_jaxpr):
+    raise TypeError
+  with name_scope('cond'):
+    outs = bind_cond(pred, *true_consts, *false_consts, *operands,
+                     true_jaxpr=true_jaxpr, false_jaxpr=false_jaxpr)
+  return tree_unflatten(out_tree, outs)
+
+# -
+
+# +
+@jit
+@name_scope('foo')
+def f(x):
+  return cond(x < 3., lambda x: x + 3., lambda x: x, x)
+f(0.)
+print(pp_jaxpr(make_jaxpr(f, get_aval(np.array(0.)))[0]))
+# -
+
+# +
+@name_scope('foo')
+def f(x):
+  print("X", x.shape, x.dtype)
+  return cond(x == 3., name_scope('true')(lambda x: x * 3.), lambda x: x, x)
+g = lambda x: grad(f)(x)
+h = lambda x: vmap(g, (0,))(x)
+print(pp_jaxpr(make_jaxpr(h, get_aval(np.ones(2)))[0]))
+# -
+
+# +
+def reinterpret(f):
+  def wrapped(*args):
+    jaxpr = make_jaxpr(f, *args)[0]
+    return eval_jaxpr(jaxpr, list(args))
+  return wrapped
+
+@name_scope('bar')
+@partial(vmap, in_axes=(0,))
+@reinterpret
+@partial(vmap, in_axes=(0,))
+def foo(x):
+  with name_scope('foo'):
+    return x * 2.
+
+print(pp_jaxpr(make_jaxpr(foo, get_aval(np.ones((4, 2))))[0]))
+# -
+
+# +
+@partial(vmap, in_axes=(0,))
+def f(x):
+  with name_scope('bar'):
+    return x * 2.
+print(pp_jaxpr(make_jaxpr(f, get_aval(np.ones(2)))[0]))
+# -

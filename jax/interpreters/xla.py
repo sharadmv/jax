@@ -42,8 +42,8 @@ from ..core import (ConcreteArray, ShapedArray, AbstractToken,
                     abstract_token)
 from ..errors import UnexpectedTracerError
 import jax._src.pretty_printer as pp
-from .._src.util import (cache, prod, unzip2, extend_name_stack, wrap_name,
-                         safe_zip, safe_map, partition_list)
+from .._src.util import (cache, prod, unzip2, extend_name_stack, new_name_stack,
+                         wrap_name, safe_zip, safe_map, partition_list)
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 from . import partial_eval as pe
@@ -101,8 +101,13 @@ def make_op_metadata(primitive: core.Primitive,
                      source_info: source_info_util.SourceInfo,
                      name_stack: str = "",
                      ) -> xc.OpMetadata:
-  eqn_str = str(pp.text(name_stack) +
+  if config.jax_experimental_name_stack:
+    name_stack = source_info.name_stack
+    eqn_str = str(pp.text(str(name_stack) + '/') +
                 pp_eqn_compact(primitive.name, params, JaxprPpContext()))
+  else:
+    eqn_str = str(pp.text(name_stack) +
+                  pp_eqn_compact(primitive.name, params, JaxprPpContext()))
   tracebacks[eqn_str] = source_info.traceback
   frame = source_info_util.user_frame(source_info) if source_info else None
   return xc.OpMetadata(
@@ -528,7 +533,7 @@ class TranslationContext:
   # with a specific platform in mind.
   platform: Optional[str]
   axis_env: AxisEnv
-  name_stack: str
+  name_stack: Union[str, source_info_util.NameStack]
 
   def replace(self, **kw): return dataclasses.replace(self, **kw)
 
@@ -559,9 +564,14 @@ def jaxpr_subcomp(ctx: TranslationContext, jaxpr: core.Jaxpr,
   _partitionmap(write, jaxpr.constvars, consts)
   _partitionmap(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
+    if config.jax_experimental_name_stack:
+      source_info = eqn.source_info.replace(
+          name_stack=ctx.name_stack + eqn.source_info.name_stack)
+    else:
+      source_info = eqn.source_info
     op_metadata = make_op_metadata(
         eqn.primitive, eqn.params, name_stack=ctx.name_stack,
-        source_info=eqn.source_info)
+        source_info=source_info)
     ctx.builder.set_op_metadata(op_metadata)
     in_nodes = _flatmap(read, eqn.invars)
     if (ctx.platform is not None and
@@ -574,7 +584,9 @@ def jaxpr_subcomp(ctx: TranslationContext, jaxpr: core.Jaxpr,
           f"XLA translation rule for primitive '{eqn.primitive.name}' not found")
 
     with source_info_util.user_context(eqn.source_info.traceback):
-      ans = rule(ctx, map(aval, eqn.invars), map(aval, eqn.outvars),
+      eqn_ctx = (ctx.replace(name_stack=source_info.name_stack) if
+          config.jax_experimental_name_stack else ctx)
+      ans = rule(eqn_ctx, map(aval, eqn.invars), map(aval, eqn.outvars),
                  *in_nodes, **eqn.params)
 
     assert isinstance(ans, collections.abc.Sequence), (ans, eqn)
@@ -825,7 +837,7 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
                                                 donated_invars=donated_invars)
   platform = backend.platform
   ctx = TranslationContext(c, platform, AxisEnv(nreps, (), ()),
-                           extend_name_stack(wrap_name(name, 'jit')))
+                           new_name_stack(wrap_name(name, 'jit')))
   out_nodes = jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
   backend = xb.get_backend(backend)
   # There is a non-zero cost to building an output tuple, particularly on TPU.

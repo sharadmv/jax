@@ -25,6 +25,7 @@ from absl import logging
 import numpy as np
 
 from jax.config import config
+from jax._src import source_info_util
 
 Seq = Sequence
 
@@ -265,8 +266,23 @@ def get_module_functions(module):
 def wrap_name(name, transform_name):
   return transform_name + '(' + name + ')'
 
-def extend_name_stack(stack, name=''):
+def new_name_stack(name: str = '') -> str:
+  return name
+
+def extend_name_stack(stack: str, name: str):
   return stack + name + '/'
+
+if config.jax_experimental_name_stack:
+
+  def new_name_stack(name: str = '') -> source_info_util.NameStack:
+    name_stack = source_info_util.NameStack()
+    if name:
+      name_stack = name_stack.extend(name)
+    return name_stack
+
+  def extend_name_stack(stack: source_info_util.NameStack,
+      name: str) -> source_info_util.NameStack:
+    return stack.extend(name)
 
 def canonicalize_axis(axis, num_dims) -> int:
   """Canonicalize an axis in [-num_dims, num_dims) to [0, num_dims)."""

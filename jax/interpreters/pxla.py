@@ -49,7 +49,7 @@ from jax._src.abstract_arrays import array_types
 from ..core import ConcreteArray, ShapedArray
 from .._src import source_info_util
 from .._src.util import (unzip3, prod, safe_map, safe_zip,
-                         extend_name_stack, wrap_name, assert_unreachable,
+                         extend_name_stack, new_name_stack, wrap_name, assert_unreachable,
                          tuple_insert, tuple_delete, distributed_debug_log)
 from ..errors import JAXTypeError
 from jax._src.lib import xla_bridge as xb
@@ -889,7 +889,7 @@ def parallel_callable(fun: lu.WrappedFun,
                                                     donated_invars=donated_invars)
   with maybe_extend_axis_env(axis_name, global_axis_size, None):  # type: ignore
     ctx = xla.TranslationContext(c, backend.platform, axis_env,
-                                 extend_name_stack(wrap_name(name, 'pmap')))
+                                 new_name_stack(wrap_name(name, 'pmap')))
     out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
   build_out_tuple = partial(xops.Tuple, c, out_nodes)
   if out_parts is not None:

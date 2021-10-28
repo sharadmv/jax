@@ -610,3 +610,8 @@ traceback_filtering = config.define_enum_state(
          " hidden stack frames, which some traceback printers support.\n"
          " * \"remove_frames\": removes hidden frames from tracebacks, and adds "
          " the unfiltered traceback as a __cause__ of the exception.\n")
+
+experimental_name_stack = config.define_bool_state(
+    name='jax_experimental_name_stack',
+    default=False,
+    help='Enable using the context manager-based name stack.')

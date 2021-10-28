@@ -55,7 +55,8 @@ from ..tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure,
                          tree_transpose, tree_leaves, tree_multimap,
                          treedef_is_leaf, treedef_children, Partial, PyTreeDef)
 from .util import (unzip2, curry, safe_map, safe_zip, prod, split_list,
-                   extend_name_stack, wrap_name, cache, wraps, HashableFunction)
+                   extend_name_stack, new_name_stack, wrap_name, cache, wraps,
+                   HashableFunction)
 from jax._src.lib import jax_jit
 from jax._src.lib import version
 from jax._src.lib import xla_bridge as xb
@@ -824,7 +825,7 @@ def xla_computation(fun: Callable,
           c, avals, should_tuple, partitions=in_parts_flat, donated_invars=donated_invars)
       ctx = xla.TranslationContext(
           c, backend, axis_env_,
-          extend_name_stack(wrap_name(fun_name, "xla_computation")))
+          new_name_stack(wrap_name(fun_name, "xla_computation")))
       out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
     build_out_tuple = partial(xc.ops.Tuple, c, out_nodes)
     if out_parts is not None:

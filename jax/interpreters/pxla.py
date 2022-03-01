@@ -554,8 +554,9 @@ if _USE_CPP_SDA:
   ShardedDeviceArrayBase = pmap_lib.ShardedDeviceArrayBase  # type: ignore
   # We want the C++ SDA to extend the DeviceArrayBase. We want this both to
   # benefit from its methods, and to have isinstance(x, DeviceArray) return true
-  ShardedDeviceArrayBase.__bases__ = ((device_array.DeviceArray,) +  # type: ignore
-                                      ShardedDeviceArrayBase.__bases__)
+  if device_array.DeviceArray not in ShardedDeviceArrayBase.__bases__:
+    ShardedDeviceArrayBase.__bases__ = ((device_array.DeviceArray,) +  # type: ignore
+                                        ShardedDeviceArrayBase.__bases__)
   _SDA_BASE_CLASS = pmap_lib.ShardedDeviceArrayBase  # type: ignore
 else:
   _SDA_BASE_CLASS: Type[device_array.DeviceArray] = device_array.DeviceArray  # type: ignore

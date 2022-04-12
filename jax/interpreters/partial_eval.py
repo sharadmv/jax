@@ -1533,8 +1533,6 @@ class DynamicJaxprTrace(core.Trace):
     with core.new_sublevel():
       jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(
         f, self.main, in_avals, keep_inputs=keep_inputs)
-    if jaxpr.effects:
-      raise NotImplementedError('Effects not supported for call primitives.')
     tracers = [*im_tracers, *explicit_tracers]
     if params.get('inline', False):
       return core.eval_jaxpr(jaxpr, consts, *tracers)

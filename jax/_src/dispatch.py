@@ -100,6 +100,22 @@ def apply_primitive(prim, *args, **params):
 # TODO(phawkins): update code referring to xla.apply_primitive to point here.
 xla.apply_primitive = apply_primitive
 
+RuntimeToken = Any
+
+class RuntimeTokenSet:
+
+  def __init__(self):
+    self.tokens = {}
+
+  def get_token(self, device, eff: core.Effect) -> RuntimeToken:
+    if eff not in self.tokens:
+      self.tokens[eff, device] = device_put(np.zeros((), np.bool_), device)
+    return self.tokens[eff, device]
+
+  def update_token(self, device, eff: core.Effect, token: RuntimeToken):
+    self.tokens[eff, device] = token
+
+runtime_tokens: RuntimeTokenSet = RuntimeTokenSet()
 
 @util.cache()
 def xla_primitive_callable(prim, *arg_specs: ArgSpec, **params):
@@ -190,7 +206,6 @@ def log_elapsed_time(fmt: str):
     elapsed_time = time.time() - start_time
     logging.log(log_priority, fmt.format(elapsed_time=elapsed_time))
 
-
 @profiler.annotate_function
 def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
                        donated_invars, *arg_specs):
@@ -206,8 +221,6 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
                         "for jit in {elapsed_time} sec"):
     jaxpr, out_avals, consts = pe.trace_to_jaxpr_final(
         fun, abstract_args, pe.debug_info_final(fun, "jit"), which_explicit)
-  if jaxpr.effects:
-    raise NotImplementedError('Lowering jaxprs with effects not supported.')
   if any(isinstance(c, core.Tracer) for c in consts):
     raise UnexpectedTracerError("Encountered an unexpected tracer.")
   # TODO(mattjj): handle argument pruning w/ dynamic shapes
@@ -237,7 +250,8 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   if not jaxpr.eqns:
     return XlaComputation(
         name, None, True, None, None, jaxpr=jaxpr, consts=consts, device=device,
-        in_avals=abstract_args, out_avals=out_avals, kept_var_idx=kept_var_idx)
+        in_avals=abstract_args, out_avals=out_avals, effects=jaxpr.effects,
+        kept_var_idx=kept_var_idx)
 
   if not _on_exit:
     log_priority = logging.WARNING if config.jax_log_compiles else logging.DEBUG
@@ -278,7 +292,8 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   return XlaComputation(
       name, module, False, donated_invars, which_explicit, nreps=nreps,
       device=device, backend=backend, tuple_args=tuple_args,
-      in_avals=abstract_args, out_avals=out_avals, kept_var_idx=kept_var_idx)
+      in_avals=abstract_args, out_avals=out_avals, effects=closed_jaxpr.effects,
+      kept_var_idx=kept_var_idx)
 
 
 def prefetch(x):
@@ -520,23 +535,37 @@ def _check_special(name, xla_shape, buf):
 def _execute_compiled(name: str, compiled: XlaExecutable,
                       input_handler: Optional[Callable],
                       output_buffer_counts: Optional[Sequence[int]],
-                      result_handlers, kept_var_idx, *args):
+                      result_handlers,
+                      effects: Sequence[core.Effect], 
+                      kept_var_idx, *args):
   device, = compiled.local_devices()
   args = input_handler(args) if input_handler else args
   input_bufs_flat = flatten(device_put(x, device) for i, x in enumerate(args)
                             if i in kept_var_idx)
+  if effects:
+    tokens_flat = flatten(runtime_tokens.get_token(device, eff) for eff in effects)
+    input_bufs_flat = [*tokens_flat, *input_bufs_flat]
+    if output_buffer_counts is None:
+      output_buffer_counts = [1]
+    output_buffer_counts = [*([1] * len(effects)), *output_buffer_counts]
   out_bufs_flat = compiled.execute(input_bufs_flat)
   check_special(name, out_bufs_flat)
   if output_buffer_counts is None:
     return (result_handlers[0](*out_bufs_flat),)
   out_bufs = unflatten(out_bufs_flat, output_buffer_counts)
+  if effects:
+    tokens, out_bufs = util.split_list(out_bufs, [len(effects)])
+    for eff, token in zip(effects, tokens):
+      runtime_tokens.update_token(device, eff, token)
   return tuple(h(*bs) for h, bs in unsafe_zip(result_handlers, out_bufs))
 
 
 def _execute_replicated(name: str, compiled: XlaExecutable,
                         input_handler: Optional[Callable],
                         output_buffer_counts: Optional[Sequence[int]],
-                        result_handlers, kept_var_idx, *args):
+                        result_handlers, 
+                        effects: Sequence[core.Effect], kept_var_idx, *args):
+  if effects: raise NotImplementedError
   if input_handler: raise NotImplementedError  # TODO(mattjj, dougalm)
   input_bufs = [flatten(device_put(x, device) for i, x in enumerate(args)
                         if i in kept_var_idx)
@@ -684,6 +713,7 @@ class XlaCompiledComputation(stages.Executable):
       tuple_args: bool,
       in_avals: Sequence[core.AbstractValue],
       out_avals: Sequence[core.AbstractValue],
+      effects: Sequence[core.Effect],
       kept_var_idx: Set[int]) -> XlaCompiledComputation:
     sticky_device = device
     input_handler = _input_handler(explicit_args, in_avals)
@@ -700,7 +730,7 @@ class XlaCompiledComputation(stages.Executable):
                      else [aval_to_num_buffers(aval) for aval in out_avals])
     execute = _execute_compiled if nreps == 1 else _execute_replicated
     unsafe_call = partial(execute, name, compiled, input_handler, buffer_counts,
-                          result_handlers, kept_var_idx)
+                          result_handlers, effects, kept_var_idx)
     return XlaCompiledComputation(compiled, in_avals, kept_var_idx, unsafe_call)
 
   def is_trivial(self):
@@ -715,10 +745,10 @@ class XlaCompiledComputation(stages.Executable):
 
   @staticmethod
   def from_trivial_jaxpr(jaxpr, consts, device, in_avals, out_avals,
-                         kept_var_idx) -> XlaCompiledComputation:
+                         effects, kept_var_idx) -> XlaCompiledComputation:
     result_handlers = map(partial(aval_to_result_handler, device), out_avals)
     unsafe_call = partial(_execute_trivial, jaxpr, device, consts,
-                          out_avals, result_handlers, kept_var_idx)
+                          out_avals, result_handlers, effects, kept_var_idx)
     return XlaCompiledComputation(None, in_avals, kept_var_idx, unsafe_call)
 
   # -- stages.Executable protocol

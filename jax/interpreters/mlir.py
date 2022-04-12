@@ -14,6 +14,7 @@
 
 # Lowering and execution path that converts jaxprs into the MLIR MHLO/CHLO
 # dialects.
+from __future__ import annotations
 
 import collections
 import dataclasses
@@ -389,6 +390,34 @@ class ModuleContext:
   def replace(self, **kw): return dataclasses.replace(self, **kw)
 
 
+Token = Sequence[ir.Value]
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenSet:
+  """An immutable container of tokens to be used to lower effectful jaxprs.
+
+  When lowering effectful jaxprs, we need to thread MHLO tokens to sequence
+  them. Each effect will need its own token that will be threaded in and out
+  of the effectful primitives. A `TokenSet` encapsulates a set of MHLO tokens
+  that will be used by the lowering rules.
+  """
+  tokens: Dict[core.Effect, Any]
+
+  def get_token(self, eff: core.Effect) -> Token:
+    return self.tokens[eff]
+
+  def update_token(self, eff: core.Effect, token: Token) -> TokenSet:
+    return TokenSet({**self.tokens, eff: token})
+
+  @classmethod
+  def from_effects(cls, effects: core.Effects) -> TokenSet:
+    """Creates a set of tokens corresponding to a set of effects."""
+    return TokenSet({
+      eff: wrap_singleton_ir_values(mhlo.CreateTokenOp(mhlo.TokenType.get()).result)
+      for eff in effects})
+
+
 @dataclasses.dataclass
 class LoweringRuleContext:
   """Per-rule context information for MLIR lowering."""
@@ -396,6 +425,8 @@ class LoweringRuleContext:
   primitive: Optional[core.Primitive]
   avals_in: Sequence[core.AbstractValue]
   avals_out: Any  # Usually Sequence[core.AbstractValue], but sometimes None.
+  tokens_in: TokenSet
+  tokens_out: Optional[TokenSet]
 
   def replace(self, **kw): return dataclasses.replace(self, **kw)
 
@@ -459,6 +490,8 @@ def sharded_aval(aval: core.ShapedArray,
     sharded_shape.append((aval.shape[i] + partitions - 1) // partitions)
   return aval.update(tuple(sharded_shape))
 
+lowerable_effects: Set[core.Effect] = set()
+
 def lower_jaxpr_to_module(
     module_name: str, jaxpr: core.ClosedJaxpr, platform: str,
     axis_context: AxisContext,
@@ -471,6 +504,8 @@ def lower_jaxpr_to_module(
 
   Handles the quirks of the argument/return value passing conventions of the
   runtime."""
+  if any(eff not in lowerable_effects for eff in jaxpr.effects):
+    raise NotImplementedError(f'Cannot lower jaxpr with effects: {jaxpr.effects}.')
   input_output_aliases = None
   in_avals = jaxpr.in_avals
   if arg_shardings is not None:
@@ -507,8 +542,9 @@ def lower_jaxpr_to_module(
     ctx.module.operation.attributes["sym_name"] = ir.StringAttr.get(
         f"{module_name}.{next(_module_unique_id)}")
     # TODO(phawkins): represent units with zero buffers at the runtime level.
+    effects = sorted(jaxpr.effects)
     lower_jaxpr_to_fun(
-        ctx, "main", jaxpr, public=True, replace_units_with_dummy=True,
+        ctx, "main", jaxpr, effects, public=True, create_tokens=True, replace_units_with_dummy=True,
         replace_tokens_with_dummy=True, replicated_args=replicated_args,
         arg_shardings=arg_shardings, result_shardings=result_shardings,
         input_output_aliases=input_output_aliases)
@@ -544,12 +580,20 @@ def _set_up_aliases(avals_in, avals_out, donated_args):
 
   return input_output_aliases, out_donated_args
 
+def dummy_value_type() -> Sequence[ir.Type]:
+  return aval_to_ir_types(core.ShapedArray((), np.dtype(np.bool_)))
+
+def dummy_value() -> Sequence[ir.Value]:
+  return ir_constants(np.zeros((), np.bool_))
+
 def lower_jaxpr_to_fun(
     ctx: ModuleContext,
     name: str,
     jaxpr: core.ClosedJaxpr,
+    effects: List[core.Effect],
     *,
     public: bool = False,
+    create_tokens: bool = False,
     replace_units_with_dummy: bool = False,
     replace_tokens_with_dummy: bool = False,
     replicated_args: Optional[Sequence[bool]] = None,
@@ -567,7 +611,11 @@ def lower_jaxpr_to_fun(
     name: the function name. The name will be uniquified by the symbol table,
       so it is ok to use the same name multiple times.
     jaxpr: the jaxpr to lower.
+    effects: a list of `core.Effect`s that correspond to the initial token
+      arguments of the resulting MHLO op.
     public: if true, the function's visibility is set to "public".
+    create_tokens: if true, creates tokens inside of the function and otherwise
+      reads them from the input arguments.
     replace_units_with_dummy: if true, unit arguments/return values are
       replaced with bool arrays of size [0].
     replace_tokens_with_dummy: if true, token arguments/return values are
@@ -591,8 +639,16 @@ def lower_jaxpr_to_fun(
       aval = core.ShapedArray((), np.dtype(np.bool_))
     return aval_to_ir_types(aval)
 
+  num_tokens = len(effects)
   input_types = map(aval_to_types, jaxpr.in_avals)
   output_types = map(aval_to_types, jaxpr.out_avals)
+
+  if create_tokens:
+    token_types = [dummy_value_type() for _ in effects]
+  else:
+    token_types = [[mhlo.TokenType.get()] for _ in effects]
+  input_types = [*token_types, *input_types]
+  output_types = [*token_types, *output_types]
   flat_input_types = util.flatten(input_types)
   flat_output_types = util.flatten(output_types)
   ftype = ir.FunctionType.get(flat_input_types, flat_output_types)
@@ -663,6 +719,11 @@ def lower_jaxpr_to_fun(
     unflattened_args = util.unflatten(flat_args,
                                       map(len, input_types))
     args: List[List[ir.Value]] = []
+    token_args, unflattened_args = util.split_list(unflattened_args, [num_tokens])
+    if create_tokens:
+      tokens = TokenSet.from_effects(jaxpr.effects)
+    else:
+      tokens = TokenSet(dict(zip(effects, token_args)))
     for aval, arg in zip(jaxpr.in_avals, unflattened_args):
       if replace_units_with_dummy and aval is core.abstract_unit:
         args.append([])
@@ -672,15 +733,20 @@ def lower_jaxpr_to_fun(
         args.append(arg)
     callee_name_stack = xla.extend_name_stack(ctx.name_stack,
                                               xla.wrap_name(name, 'jit'))
-    out_vals = jaxpr_subcomp(ctx.replace(name_stack=callee_name_stack),
-                             jaxpr.jaxpr, map(ir_constants, jaxpr.consts),
-                             *args)
+    out_vals, tokens = jaxpr_subcomp(ctx.replace(name_stack=callee_name_stack),
+                                     jaxpr.jaxpr, tokens, map(ir_constants, jaxpr.consts),
+                                     *args)
     outs = []
+    for eff in effects:
+      if create_tokens:
+        outs.append(dummy_value())
+      else:
+        outs.append(tokens.get_token(eff))
     for aval, out in zip(jaxpr.out_avals, out_vals):
       if replace_units_with_dummy and aval is core.abstract_unit:
-        outs.append(ir_constants(np.zeros((), np.bool_)))
+        outs.append(dummy_value())
       elif replace_tokens_with_dummy and aval is core.abstract_token:
-        outs.append(ir_constants(np.zeros((), np.bool_)))
+        outs.append(dummy_value())
       else:
         outs.append(out)
     flat_outputs = util.flatten(outs)
@@ -712,9 +778,9 @@ def _emit_lowering_rule_as_fun(lowering_rule,
     func_dialect.ReturnOp(util.flatten(map(wrap_singleton_ir_values, outs)))
   return func_op
 
-def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
+def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr, tokens: TokenSet,
                   consts: Sequence[Sequence[ir.Value]],
-                  *args: Sequence[ir.Value]) -> Sequence[Sequence[ir.Value]]:
+                  *args: Sequence[ir.Value]) -> Tuple[Sequence[Sequence[ir.Value]], TokenSet]:
   """Lowers a jaxpr into mHLO, inlined into an existing function.
 
   Assumes that an MLIR context, location, and insertion point are set.
@@ -764,9 +830,12 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
 
       rule_ctx = LoweringRuleContext(
           module_context=ctx, primitive=eqn.primitive,
-          avals_in=map(aval, eqn.invars), avals_out=map(aval, eqn.outvars))
+          avals_in=map(aval, eqn.invars), avals_out=map(aval, eqn.outvars),
+          tokens_in=tokens, tokens_out=None)
       ans = rule(rule_ctx, *map(_unwrap_singleton_ir_values, in_nodes),
                  **eqn.params)
+      if rule_ctx.tokens_out is not None:
+        tokens = rule_ctx.tokens_out
 
     try:
       out_nodes = tuple(map(wrap_singleton_ir_values, ans))
@@ -778,7 +847,7 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
     assert all(isinstance(v, ir.Value) for w in out_nodes for v in w), (ans, eqn)
     assert len(ans) == len(eqn.outvars), (ans, eqn)
     map(write, eqn.outvars, out_nodes)
-  return map(read, jaxpr.outvars)
+  return map(read, jaxpr.outvars), tokens
 
 def _ir_consts(consts):
   unique_consts = {id(const): const for const in consts}
@@ -808,7 +877,7 @@ def lower_fun(fun: Callable, multiple_results: bool = True) -> Callable:
 
 
 def _call_lowering(fn_name, stack_name, call_jaxpr, backend, ctx, avals_in,
-                   avals_out, *args):
+                   avals_out, tokens_in: TokenSet, *args):
   xla.check_backend_matches(backend, ctx.platform)
   output_types = map(aval_to_ir_types, avals_out)
   flat_output_types = util.flatten(output_types)

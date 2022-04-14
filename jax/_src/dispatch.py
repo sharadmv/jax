@@ -568,7 +568,7 @@ def _check_special(name, xla_shape, buf):
 def _execute_compiled(name: str, compiled: XlaExecutable,
                       input_handler: Optional[Callable],
                       output_buffer_counts: Optional[Sequence[int]],
-                      result_handlers, 
+                      result_handlers,
                       effects: List[core.Effect],
                       kept_var_idx, *args):
   device, = compiled.local_devices()

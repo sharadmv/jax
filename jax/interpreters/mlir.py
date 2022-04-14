@@ -473,8 +473,13 @@ def sharded_aval(aval: core.ShapedArray,
     sharded_shape.append((aval.shape[i] + partitions - 1) // partitions)
   return aval.update(tuple(sharded_shape))
 
+
+lowerable_effects: Set[core.Effect] = set()
+
 def lower_jaxpr_to_module(
-    module_name: str, jaxpr: core.ClosedJaxpr, platform: str,
+    module_name: str, jaxpr: core.ClosedJaxpr,
+    effects: List[core.Effect],
+    platform: str,
     axis_context: AxisContext,
     name_stack: NameStack, donated_args: Sequence[bool],
     replicated_args: Optional[Sequence[bool]] = None,
@@ -502,6 +507,8 @@ def lower_jaxpr_to_module(
   if platform in platforms_with_donation:
     input_output_aliases, donated_args = _set_up_aliases(
         in_avals, out_avals, donated_args)
+  if any(eff not in lowerable_effects for eff in jaxpr.effects):
+    raise ValueError(f'Cannot lower jaxpr with effects: {jaxpr.effects}')
   if any(donated_args):
     # TODO(tomhennigan): At call time we should mark these buffers as deleted.
     unused_donations = [str(a) for a, d in zip(in_avals, donated_args)
@@ -522,7 +529,8 @@ def lower_jaxpr_to_module(
         f"{module_name}.{next(_module_unique_id)}")
     # TODO(phawkins): represent units with zero buffers at the runtime level.
     lower_jaxpr_to_fun(
-        ctx, "main", jaxpr, public=True, replace_units_with_dummy=True,
+        ctx, "main", jaxpr, effects, public=True, use_dummy_tokens=True,
+        replace_units_with_dummy=True,
         replace_tokens_with_dummy=True, replicated_args=replicated_args,
         arg_shardings=arg_shardings, result_shardings=result_shardings,
         input_output_aliases=input_output_aliases)
@@ -558,12 +566,20 @@ def _set_up_aliases(avals_in, avals_out, donated_args):
 
   return input_output_aliases, out_donated_args
 
+def dummy_token_type() -> Sequence[ir.Type]:
+  return aval_to_ir_types(core.ShapedArray((), np.bool_))
+
+def dummy_token() -> Sequence[ir.Value]:
+  return ir_constants(np.zeros((), np.bool_))
+
 def lower_jaxpr_to_fun(
     ctx: ModuleContext,
     name: str,
     jaxpr: core.ClosedJaxpr,
+    effects: List[core.Effect],
     *,
     public: bool = False,
+    use_dummy_tokens: bool = False,
     replace_units_with_dummy: bool = False,
     replace_tokens_with_dummy: bool = False,
     replicated_args: Optional[Sequence[bool]] = None,
@@ -581,7 +597,11 @@ def lower_jaxpr_to_fun(
     name: the function name. The name will be uniquified by the symbol table,
       so it is ok to use the same name multiple times.
     jaxpr: the jaxpr to lower.
+    effects: a list of effects corresponding to the initial token inputs to
+      the function.
     public: if true, the function's visibility is set to "public".
+    use_dummy_tokens: if true, the inputs to the function should be dummy values
+      instead of MHLO tokens.
     replace_units_with_dummy: if true, unit arguments/return values are
       replaced with bool arrays of size [0].
     replace_tokens_with_dummy: if true, token arguments/return values are
@@ -607,6 +627,12 @@ def lower_jaxpr_to_fun(
 
   input_types = map(aval_to_types, jaxpr.in_avals)
   output_types = map(aval_to_types, jaxpr.out_avals)
+  if effects:
+    if use_dummy_tokens:
+      token_types = [dummy_token_type() for _ in effects]
+      input_types = [*token_types, *input_types]
+      output_types = [*token_types, *output_types]
+
   flat_input_types = util.flatten(input_types)
   flat_output_types = util.flatten(output_types)
   ftype = ir.FunctionType.get(flat_input_types, flat_output_types)
@@ -675,6 +701,8 @@ def lower_jaxpr_to_fun(
       flat_args = map(wrap_with_sharding_op, flat_args, ir_arg_shardings)
 
     unflattened_args = util.unflatten(flat_args, map(len, input_types))
+    if use_dummy_tokens:
+      unflattened_args = unflattened_args[len(effects):]
     args: List[List[ir.Value]] = []
     for aval, arg in zip(jaxpr.in_avals, unflattened_args):
       if replace_units_with_dummy and aval is core.abstract_unit:
@@ -689,6 +717,10 @@ def lower_jaxpr_to_fun(
                              jaxpr.jaxpr, map(ir_constants, jaxpr.consts),
                              *args)
     outs = []
+    if effects:
+      if use_dummy_tokens:
+        for _ in effects:
+          outs.append(dummy_token())
     for aval, out in zip(jaxpr.out_avals, out_vals):
       if replace_units_with_dummy and aval is core.abstract_unit:
         outs.append(ir_constants(np.zeros((), np.bool_)))
@@ -834,7 +866,8 @@ def _call_lowering(fn_name, stack_name, call_jaxpr, backend, ctx, avals_in,
   output_types = map(aval_to_ir_types, avals_out)
   flat_output_types = util.flatten(output_types)
   symbol_name = lower_jaxpr_to_fun(ctx, fn_name,
-                                   core.ClosedJaxpr(call_jaxpr, ())).name.value
+                                   core.ClosedJaxpr(call_jaxpr, ()),
+                                   []).name.value
   call = func_dialect.CallOp(flat_output_types,
                              ir.FlatSymbolRefAttr.get(symbol_name),
                              flatten_lowering_ir_args(args))

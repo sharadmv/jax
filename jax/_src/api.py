@@ -482,13 +482,15 @@ def _cpp_jit(
         # has been reset to None). Thus, we do not support the fast-path.
         execute is not None and
         execute.func is dispatch._execute_compiled and  # not trivial, not pmap
+        # No effects in computation
+        not execute.args[5] and
         # Not supported: ShardedDeviceArray
         all(device_array.type_is_device_array(x) for x in out_flat) and
         # Not supported: dynamic shapes
         not jax.config.jax_dynamic_shapes)
     ### If we can use the fastpath, we return required info to the caller.
     if use_fastpath:
-      _, xla_executable, _, _, result_handlers, kept_var_idx = execute.args
+      _, xla_executable, _, _, result_handlers, _, kept_var_idx = execute.args
       sticky_device = None
       avals = []
       lazy_exprs = [None] * len(result_handlers)
@@ -812,9 +814,11 @@ def xla_computation(fun: Callable,
       else:
         out_parts_flat = tuple(flatten_axes(
             "xla_computation out_parts", out_tree(), out_parts))
+      effects = sorted(jaxpr.effects)
       m = mlir.lower_jaxpr_to_module(
           f"xla_computation_{fun_name}",
           core.ClosedJaxpr(jaxpr, consts),
+          effects=effects,
           platform=backend,
           axis_context=mlir.ReplicaAxisContext(axis_env_),
           name_stack=new_name_stack(wrap_name(fun_name, "xla_computation")),

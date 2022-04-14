@@ -21,9 +21,11 @@ from jax import ad_checkpoint
 from jax import core
 from jax import lax
 from jax import linear_util as lu
+from jax.config import config
 from jax.experimental import maps
 from jax.experimental import pjit
-from jax.config import config
+from jax.interpreters import mlir
+from jax._src import dispatch
 from jax._src import test_util as jtu
 import numpy as np
 
@@ -35,6 +37,10 @@ effect_p.multiple_results = True
 @effect_p.def_effectful_abstract_eval
 def _(*, effect):
   return [], {effect}
+
+def effect_lowering(ctx, *, effect):
+  return []
+mlir.register_lowering(effect_p, effect_lowering)
 
 
 class JaxprEffectsTest(jtu.JaxTestCase):
@@ -175,15 +181,106 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
 
 class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
 
-  def test_cannot_lower_jaxpr_with_effects_in_hop(self):
+  def setUp(self):
+    super().setUp()
+    dispatch.runtime_tokens.tokens = {}
+    mlir.lowerable_effects.add('print')
+    mlir.lowerable_effects.add('print2')
+
+  def tearDown(self):
+    super().tearDown()
+    mlir.lowerable_effects.remove('print')
+    mlir.lowerable_effects.remove('print2')
+
+  def test_cannot_lower_unlowerable_effect(self):
     @jax.jit
     def f(x):
       effect_p.bind(effect='foo')
       return x + 1.
-    with self.assertRaisesRegex(NotImplementedError, 'Lowering jaxprs with '
-        'effects not supported'):
+    with self.assertRaisesRegex(ValueError, 'Cannot lower jaxpr with effects'):
       f(2.)
 
+  def test_lowered_jaxpr_with_effects_takes_in_dummy_inputs(self):
+    @jax.jit
+    def f(x):
+      effect_p.bind(effect='print')
+      return x + 1.
+    mhlo = f.lower(1.).compiler_ir(dialect='mhlo')
+    input_types = mhlo.body.operations[0].type.inputs
+    # First argument should be dummy token
+    self.assertLen(list(input_types), 2)
+    self.assertEqual(str(input_types[0]), 'tensor<i1>')
+    self.assertEqual(str(input_types[1]), 'tensor<f32>')
+
+    # First output should be dummy token
+    result_types = mhlo.body.operations[0].type.results
+    self.assertLen(list(result_types), 2)
+    self.assertEqual(str(result_types[0]), 'tensor<i1>')
+    self.assertEqual(str(result_types[1]), 'tensor<f32>')
+
+  def test_lowered_jaxpr_with_multiple_effects_takes_in_dummy_inputs(self):
+    @jax.jit
+    def f(x):
+      effect_p.bind(effect='print')
+      effect_p.bind(effect='print2')
+      return x + 1.
+    mhlo = f.lower(1.).compiler_ir(dialect='mhlo')
+    input_types = mhlo.body.operations[0].type.inputs
+    # First two arguments should be dummy values
+    self.assertLen(list(input_types), 3)
+    self.assertEqual(str(input_types[0]), 'tensor<i1>')
+    self.assertEqual(str(input_types[1]), 'tensor<i1>')
+    self.assertEqual(str(input_types[2]), 'tensor<f32>')
+
+    # First two outputs should be dummy values
+    result_types = mhlo.body.operations[0].type.results
+    self.assertLen(list(result_types), 3)
+    self.assertEqual(str(result_types[0]), 'tensor<i1>')
+    self.assertEqual(str(result_types[1]), 'tensor<i1>')
+    self.assertEqual(str(result_types[2]), 'tensor<f32>')
+
+  def test_can_lower_and_run_jaxpr_with_lowerable_effects(self):
+    @jax.jit
+    def f(x):
+      effect_p.bind(effect='print')
+      return x + 1.
+    self.assertEqual(f(2.), 3.)
+
+  def test_runtime_tokens_should_update_after_running_effectful_function(self):
+    @jax.jit
+    def f(x):
+      effect_p.bind(effect='print')
+      return x + 1.
+    self.assertNotIn('print', dispatch.runtime_tokens.tokens)
+    f(2.)
+    prev_token_id = id(dispatch.runtime_tokens.tokens['print'])
+    f(2.)
+    curr_token_id = id(dispatch.runtime_tokens.tokens['print'])
+    self.assertNotEqual(prev_token_id, curr_token_id)
+
+  def test_can_lower_multiple_effects(self):
+    @jax.jit
+    def f(x):
+      effect_p.bind(effect='print')
+      effect_p.bind(effect='print2')
+      return x + 1.
+    @jax.jit
+    def g(x):
+      effect_p.bind(effect='print')
+      return x + 1.
+    self.assertNotIn('print', dispatch.runtime_tokens.tokens)
+    self.assertNotIn('print2', dispatch.runtime_tokens.tokens)
+    f(2.)
+    print_token_id = id(dispatch.runtime_tokens.tokens['print'][0])
+    print2_token_id = id(dispatch.runtime_tokens.tokens['print'][0])
+    f(2.)
+    self.assertNotEqual(print_token_id, id(dispatch.runtime_tokens.tokens['print'][0]))
+    self.assertNotEqual(print2_token_id, id(dispatch.runtime_tokens.tokens['print2'][0]))
+    print_token_id = id(dispatch.runtime_tokens.tokens['print'][0])
+    print2_token_id = id(dispatch.runtime_tokens.tokens['print2'][0])
+    g(2.)
+    self.assertNotEqual(print_token_id, id(dispatch.runtime_tokens.tokens['print'][0]))
+    self.assertEqual(print2_token_id, id(dispatch.runtime_tokens.tokens['print2'][0]))
 
 class ControlFlowEffectsTest(jtu.JaxTestCase):
 

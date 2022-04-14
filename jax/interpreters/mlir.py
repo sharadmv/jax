@@ -567,10 +567,10 @@ def _set_up_aliases(avals_in, avals_out, donated_args):
   return input_output_aliases, out_donated_args
 
 def dummy_token_type() -> Sequence[ir.Type]:
-  return aval_to_ir_types(core.ShapedArray((), np.bool_))
+  return aval_to_ir_types(core.ShapedArray((0,), np.bool_))
 
 def dummy_token() -> Sequence[ir.Value]:
-  return ir_constants(np.zeros((), np.bool_))
+  return ir_constants(np.zeros(0, np.bool_))
 
 def lower_jaxpr_to_fun(
     ctx: ModuleContext,

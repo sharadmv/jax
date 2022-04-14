@@ -110,7 +110,7 @@ class RuntimeTokenSet:
 
   def get_token(self, eff: core.Effect, device: Device) -> RuntimeToken:
     if eff not in self.tokens or self.tokens[eff][1] != device:
-      self.tokens[eff] = device_put(np.zeros((), np.bool_), device), device
+      self.tokens[eff] = device_put(np.zeros(0, np.bool_), device), device
     return self.tokens[eff][0]
 
   def update_token(self, eff: core.Effect, token: RuntimeToken):

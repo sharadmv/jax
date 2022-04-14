@@ -210,13 +210,11 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
     # First argument should be dummy token
     self.assertLen(list(input_types), 2)
     self.assertEqual(str(input_types[0]), 'tensor<i1>')
-    self.assertEqual(str(input_types[1]), 'tensor<f32>')
 
     # First output should be dummy token
     result_types = mhlo.body.operations[0].type.results
     self.assertLen(list(result_types), 2)
     self.assertEqual(str(result_types[0]), 'tensor<i1>')
-    self.assertEqual(str(result_types[1]), 'tensor<f32>')
 
   def test_lowered_jaxpr_with_multiple_effects_takes_in_dummy_inputs(self):
     @jax.jit
@@ -230,14 +228,12 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
     self.assertLen(list(input_types), 3)
     self.assertEqual(str(input_types[0]), 'tensor<i1>')
     self.assertEqual(str(input_types[1]), 'tensor<i1>')
-    self.assertEqual(str(input_types[2]), 'tensor<f32>')
 
     # First two outputs should be dummy values
     result_types = mhlo.body.operations[0].type.results
     self.assertLen(list(result_types), 3)
     self.assertEqual(str(result_types[0]), 'tensor<i1>')
     self.assertEqual(str(result_types[1]), 'tensor<i1>')
-    self.assertEqual(str(result_types[2]), 'tensor<f32>')
 
   def test_can_lower_and_run_jaxpr_with_lowerable_effects(self):
     @jax.jit

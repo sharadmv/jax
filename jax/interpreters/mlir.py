@@ -627,13 +627,26 @@ def lower_jaxpr_to_fun(
 
   input_types = map(aval_to_types, jaxpr.in_avals)
   output_types = map(aval_to_types, jaxpr.out_avals)
-  if effects:
-    if use_dummy_tokens:
-      token_types = [dummy_token_type() for _ in effects]
-      input_types = [*token_types, *input_types]
-      output_types = [*token_types, *output_types]
-      if input_output_aliases:
-        input_output_aliases = [*([None] * len(effects)), *input_output_aliases]
+
+  # Add token inputs/outputs for effectful jaxprs
+  if use_dummy_tokens:
+    token_types = [dummy_token_type() for _ in effects]
+  else:
+    token_types = [[mhlo.TokenType.get()] for _ in effects]
+  input_types = [*token_types, *input_types]
+  output_types = [*token_types, *output_types]
+  if input_output_aliases:
+    token_input_output_aliases = [None for _ in effects]
+    input_output_aliases = [*token_input_output_aliases, *input_output_aliases]
+  if arg_shardings:
+    token_shardings = [None for _ in effects]
+    arg_shardings = [*token_shardings, *arg_shardings]
+  if result_shardings:
+    token_shardings = [None for _ in effects]
+    result_shardings = [*token_shardings, *result_shardings]
+  if replicated_args:
+    token_replicated_args = [False for _ in effects]
+    replicated_args = [*token_replicated_args, *replicated_args]
 
   flat_input_types = util.flatten(input_types)
   flat_output_types = util.flatten(output_types)

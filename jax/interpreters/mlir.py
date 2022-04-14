@@ -632,6 +632,8 @@ def lower_jaxpr_to_fun(
       token_types = [dummy_token_type() for _ in effects]
       input_types = [*token_types, *input_types]
       output_types = [*token_types, *output_types]
+      if input_output_aliases:
+        input_output_aliases = [*([None] * len(effects)), *input_output_aliases]
 
   flat_input_types = util.flatten(input_types)
   flat_output_types = util.flatten(output_types)

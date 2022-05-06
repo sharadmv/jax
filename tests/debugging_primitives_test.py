@@ -44,6 +44,15 @@ def capture_stdout() -> Generator[Callable[[], str], None, None]:
 def _format_multiline(text):
   return textwrap.dedent(text).lstrip()
 
+def setUpModule():
+  global prev_xla_flags
+  # This will control the CPU devices.
+  prev_xla_flags = jtu.set_host_platform_device_count(4)
+
+# Reset to previous configuration in case other test modules will be run.
+def tearDownModule():
+  prev_xla_flags()
+
 class DebugPrintTest(jtu.JaxTestCase):
 
   @jtu.skip_on_devices("tpu", "gpu")
@@ -254,6 +263,75 @@ class DebugPrintControlFlowTest(jtu.JaxTestCase):
     self.assertEqual(output(), _format_multiline("""
       x: 10
       """))
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+    dict(testcase_name="_ordered" if ordered else "", ordered=ordered)
+         for ordered in [False, True]))
+  @jtu.skip_on_devices("tpu", "gpu")
+  def test_can_print_inside_cond(self, ordered):
+    def f(x):
+      def true_fun(x):
+        debug_print("true: {}", x, ordered=ordered)
+        return x
+      def false_fun(x):
+        debug_print("false: {}", x, ordered=ordered)
+        return x
+      return lax.cond(x < 5, true_fun, false_fun, x)
+    with capture_stdout() as output:
+      f(5)
+    self.assertEqual(output(), _format_multiline("""
+      false: 5
+      """))
+    with capture_stdout() as output:
+      f(4)
+    self.assertEqual(output(), _format_multiline("""
+      true: 4
+      """))
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+    dict(testcase_name="_ordered" if ordered else "", ordered=ordered)
+         for ordered in [False, True]))
+  @jtu.skip_on_devices("tpu", "gpu")
+  def test_can_print_inside_switch(self, ordered):
+    def f(x):
+      def b1(x):
+        debug_print("b1: {}", x, ordered=ordered)
+        return x
+      def b2(x):
+        debug_print("b2: {}", x, ordered=ordered)
+        return x
+      def b3(x):
+        debug_print("b3: {}", x, ordered=ordered)
+        return x
+      return lax.switch(x, (b1, b2, b3), x)
+    with capture_stdout() as output:
+      f(0)
+    self.assertEqual(output(), _format_multiline("""
+      b1: 0
+      """))
+    with capture_stdout() as output:
+      f(1)
+    self.assertEqual(output(), _format_multiline("""
+      b2: 1
+      """))
+    with capture_stdout() as output:
+      f(2)
+    self.assertEqual(output(), _format_multiline("""
+      b3: 2
+      """))
+
+class DebugPrintPmapTest(jtu.JaxTestCase):
+  
+  @jtu.skip_on_devices("tpu", "gpu")
+  def test_print_in_pmap(self):
+    @jax.pmap
+    def f(x):
+      debug_print('x: {}', x)
+      return x
+    with capture_stdout() as output:
+      f(jnp.arange(jax.local_device_count())).block_until_ready()
+    self.assertSetEqual({"x: 0", "x: 1", "x: 2", "x: 3"},
+        set(output().strip().split("\n")))
 
 if jaxlib.version < (0, 3, 8):
   # No lowering for `emit_python_callback` in older jaxlibs.

@@ -36,7 +36,7 @@ def matmul_kernel(
     N=n
     K=k
     stride_am=K
-    stride_ak=1,
+    stride_ak=1
     stride_bk=N
     stride_bn=1
     stride_cm=N
@@ -99,8 +99,7 @@ def matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    # tl.store(c_ptrs, c, mask=c_mask)
-    tl.store(c_ptrs, 1., mask=c_mask)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 def matmul(a, b, activation=None):
     out_shape = SimpleNamespace(shape=(a.shape[0], b.shape[1]), dtype=a.dtype)
@@ -113,6 +112,7 @@ def matmul(a, b, activation=None):
         triton.cdiv(m, META['BLOCK_SIZE_M']) * triton.cdiv(n, META['BLOCK_SIZE_N']),
     )
     return j2t.triton_call(a, b, kernel=matmul_kernel, out_shape=out_shape, grid=grid, 
+            num_warps=4, num_stages=2,
 	    BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
 	    GROUP_SIZE_M=GROUP_SIZE_M, ACTIVATION=activation)
 

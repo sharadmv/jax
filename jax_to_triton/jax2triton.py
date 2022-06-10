@@ -52,11 +52,11 @@ def get_triton_python_ir(aval):
         return "scalar", get_triton_type(aval)
     return "ptr", get_triton_type(aval)
 
-def compile(triton_function, constants, *, key, device=0):
+def compile(triton_function, constants, *, key, device=0, num_warps=4, num_stages=2):
     def lower(*args):
         arg_types = [get_triton_python_ir(a) for a in args]
         attributes = {i: 16 for i in range(len(args))}
-        triton_function._warmup(arg_types=arg_types, device=device, attributes=attributes, constants=constants, num_warps=4, num_stages=2, key=key, is_manual_warmup=True)
+        triton_function._warmup(arg_types=arg_types, device=device, attributes=attributes, constants=constants, num_warps=num_warps, num_stages=num_stages, key=key, is_manual_warmup=True)
         pass
     return lower
 
@@ -96,24 +96,29 @@ def aval_to_layout(aval):
   arange = np.arange(aval.ndim, dtype='int64')[::-1].copy()
   return ir.DenseIntElementsAttr.get(arange, type=ir.IndexType.get())
 
-def emit_triton_call(triton_func, avals_in, avals_out, **metaparams):
+def emit_triton_call(triton_func, avals_in, avals_out, grid, num_warps, num_stages, **metaparams):
   aval_out, = avals_out
   metadata = {triton_func.arg_names.index(k) : v for k, v in metaparams.items()}
-  # import inspect
-  # breakpoint()
-  compile(triton_func, metadata, key="foo")(*avals_in, aval_out)
+  compile(triton_func, metadata, num_warps=num_warps, num_stages=num_stages, key="foo")(*avals_in, aval_out)
   loaded_binary = triton_func.bin_cache["foo"]
   kernel_ptr = loaded_binary.kernel
   shared_mem = loaded_binary.shared_mem
-  grid_0, grid_1, grid_2 = 1, 1, 1
+  grid_ = grid(metaparams)
+  grid_0 = grid_[0]
+  if len(grid_) == 1:
+    grid_1, grid_2 = 1, 1
+  elif len(grid_) == 2:
+    grid_1, grid_2 = grid_[1], 1
+  elif len(grid_) == 3:
+    grid_1, grid_2 = grid_[1], grid_[2]
   arity = len(avals_in) + 1
-  descriptor = custom_call.make_triton_call_descriptor(kernel_ptr, shared_mem, grid_0, grid_1, grid_2, arity)
+  descriptor = custom_call.make_triton_call_descriptor(kernel_ptr, shared_mem, grid_0, grid_1, grid_2, num_warps, arity)
   return descriptor
 
-def triton_call_lowering(ctx, *args, kernel, out_shape, grid, **metaparams):
+def triton_call_lowering(ctx, *args, kernel, out_shape, grid, num_warps, num_stages, **metaparams):
   out_type = ir.RankedTensorType.get(out_shape.shape, mlir.dtype_to_ir_type(out_shape.dtype))
   i32_type = ir.IntegerType.get_signless(32)
-  descriptor = emit_triton_call(kernel, ctx.avals_in, ctx.avals_out, **metaparams)
+  descriptor = emit_triton_call(kernel, ctx.avals_in, ctx.avals_out, grid, num_warps, num_stages, **metaparams)
   n_elems = ctx.avals_out[0].size
   out = mhlo.CustomCallOp(
             [out_type], args,
@@ -122,7 +127,6 @@ def triton_call_lowering(ctx, *args, kernel, out_shape, grid, **metaparams):
             backend_config=ir.StringAttr.get(descriptor),
             api_version=ir.IntegerAttr.get(i32_type, 1),
             called_computations=ir.ArrayAttr.get([]),
-            # operand_layouts=avals_to_layouts(ctx.avals_in + [core.ShapedArray((), jnp.int32)]),
             operand_layouts=avals_to_layouts(ctx.avals_in),
             result_layouts=avals_to_layouts(ctx.avals_out))
   return out.results

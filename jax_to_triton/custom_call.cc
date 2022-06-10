@@ -7,34 +7,66 @@
 
 namespace py = pybind11;
 
+template <typename T>
+std::string PackDescriptorAsString(const T& descriptor) {
+  return std::string(reinterpret_cast<const char*>(&descriptor), sizeof(T));
+}
+
+template <typename T>
+void UnpackDescriptor(T* descriptor_ptr, const char* opaque, std::size_t opaque_len) {
+  if (opaque_len != sizeof(T)) {
+    throw std::invalid_argument( "received negative value" );
+  }
+  std::memcpy(descriptor_ptr, opaque, opaque_len);
+}
+
+struct TritonCallDescriptor {
+  CUfunction kernel_ptr;
+  std::uint32_t shared_mem;
+  std::uint32_t grid_0;
+  std::uint32_t grid_1;
+  std::uint32_t grid_2;
+  std::uint32_t arity;
+};
 
 void do_custom_call(CUstream stream, void** buffers,
 		char* opaque, size_t opaque_len) {
-	uint64_t descriptor = *reinterpret_cast<uint64_t*>(opaque);
-	CUfunction kernel = reinterpret_cast<CUfunction>(descriptor);
-	int grid_0 = 1;
-	int grid_1 = 1;
-	int grid_2 = 1;
+	TritonCallDescriptor descriptor;
+	UnpackDescriptor(&descriptor, opaque, opaque_len);
+	CUfunction kernel = descriptor.kernel_ptr;
+	int grid_0 = descriptor.grid_0;
+	int grid_1 = descriptor.grid_1;
+	int grid_2 = descriptor.grid_2;
+	int arity = descriptor.arity;
 	std::string params;
-	params.resize(8 * 3);
+	params.resize(8 * arity);
 	char* params_ptr = &params[0];
-	size_t params_size;
-	params_ptr = (char*)(((uintptr_t)params_ptr + 7) & (-8));
-	std::memcpy(params_ptr, &buffers[0], 8);
-	params_ptr += 8;
-	params_ptr = (char*)(((uintptr_t)params_ptr + 7) & (-8));
-	std::memcpy(params_ptr, &buffers[1], 8);
-	params_ptr += 8;
-	params_ptr = (char*)(((uintptr_t)params_ptr + 7) & (-8));
-	std::memcpy(params_ptr, &buffers[2], 8);
-	params_ptr += 8;
-	params_size = (std::ptrdiff_t)(params_ptr - &params[0]);
+        for (int i = 0; i < arity; i++) {
+		params_ptr = (char*)(((uintptr_t)params_ptr + 7) & (-8));
+		std::memcpy(params_ptr, &buffers[i], 8);
+		params_ptr += 8;
+        }
+	size_t params_size = (std::ptrdiff_t)(params_ptr - &params[0]);
 	void* config[] = {
 	  CU_LAUNCH_PARAM_BUFFER_POINTER, params.data(),
 	  CU_LAUNCH_PARAM_BUFFER_SIZE, &params_size,
 	  CU_LAUNCH_PARAM_END
 	};
-	CUresult result = cuLaunchKernel(kernel, grid_0, grid_1, grid_2, 4 * 32, 1, 1, 0, stream, nullptr, config);
+	CUresult result = cuLaunchKernel(kernel, grid_0, grid_1, grid_2, 4 * 32, 1, 1, 512, stream, nullptr, config);
+        if (result != 0) {
+		std::cout << "Failed launch: " << result << std::endl;
+        }
+}
+
+std::string MakeTritonCallDescriptor(uint64_t kernel_ptr, uint32_t shared_mem, uint32_t grid_0, uint32_t grid_1, uint32_t grid_2, uint32_t arity) {
+	TritonCallDescriptor descriptor;
+	descriptor.kernel_ptr = reinterpret_cast<CUfunction>(kernel_ptr);
+	descriptor.shared_mem = shared_mem;
+	descriptor.grid_0 = grid_0;
+	descriptor.grid_1 = grid_1;
+	descriptor.grid_2 = grid_2;
+	descriptor.arity = arity;
+	return PackDescriptorAsString(descriptor);
 }
 
 template <typename T>
@@ -43,6 +75,7 @@ pybind11::capsule EncapsulateFunction(T* fn) {
 }
 
 PYBIND11_MODULE(custom_call, m) {
-	m.def("get_custom_call", [](){ return EncapsulateFunction(do_custom_call); });
+	m.def("make_triton_call_descriptor", [](uint64_t kernel_ptr, uint32_t shared_mem, uint32_t grid_0, uint32_t grid_1, uint32_t grid_2, uint32_t arity){ return py::bytes(MakeTritonCallDescriptor(kernel_ptr, shared_mem, grid_0, grid_1, grid_2, arity));
+});
+m.def("get_custom_call", [](){ return EncapsulateFunction(do_custom_call); });
 }
-

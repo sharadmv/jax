@@ -101,6 +101,10 @@ def matmul_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+@triton.jit
+def relu(x):
+    return tl.where(x >= 0, x, 0)
+
 def matmul(a, b, activation=None):
     out_shape = SimpleNamespace(shape=(a.shape[0], b.shape[1]), dtype=a.dtype)
     BLOCK_SIZE_M=128
@@ -116,7 +120,8 @@ def matmul(a, b, activation=None):
 	    BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
 	    GROUP_SIZE_M=GROUP_SIZE_M, ACTIVATION=activation)
 
-a = jnp.ones((m, k), dtype=jnp.float32)
-b = jnp.ones((k, n), dtype=jnp.float32)
-print(matmul(a, b).block_until_ready())
-print(jax.jit(matmul)(a, b).block_until_ready())
+k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+a = jax.random.normal(k1, (m, k), dtype=jnp.float32)
+b = jax.random.normal(k2, (k, n), dtype=jnp.float32)
+print(matmul(a, b, relu).block_until_ready())
+print(jax.jit(matmul, static_argnums=2)(a, b, relu).block_until_ready())

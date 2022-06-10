@@ -9,11 +9,13 @@ namespace py = pybind11;
 
 template <typename T>
 std::string PackDescriptorAsString(const T& descriptor) {
+  std::cout << "pack len=" <<  sizeof(T) << std::endl;
   return std::string(reinterpret_cast<const char*>(&descriptor), sizeof(T));
 }
 
 template <typename T>
 void UnpackDescriptor(T* descriptor_ptr, const char* opaque, std::size_t opaque_len) {
+  std::cout << "opaque_len=" <<  opaque_len << std::endl;
   if (opaque_len != sizeof(T)) {
     throw std::invalid_argument( "received negative value" );
   }
@@ -52,7 +54,7 @@ void do_custom_call(CUstream stream, void** buffers,
 	  CU_LAUNCH_PARAM_BUFFER_SIZE, &params_size,
 	  CU_LAUNCH_PARAM_END
 	};
-	CUresult result = cuLaunchKernel(kernel, grid_0, grid_1, grid_2, 4 * 32, 1, 1, 512, stream, nullptr, config);
+	CUresult result = cuLaunchKernel(kernel, grid_0, grid_1, grid_2, 4 * 32, 1, 1, descriptor.shared_mem, stream, nullptr, config);
         if (result != 0) {
 		std::cout << "Failed launch: " << result << std::endl;
         }

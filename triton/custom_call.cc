@@ -9,13 +9,11 @@ namespace py = pybind11;
 
 template <typename T>
 std::string PackDescriptorAsString(const T& descriptor) {
-  std::cout << "pack len=" <<  sizeof(T) << std::endl;
   return std::string(reinterpret_cast<const char*>(&descriptor), sizeof(T));
 }
 
 template <typename T>
 void UnpackDescriptor(T* descriptor_ptr, const char* opaque, std::size_t opaque_len) {
-  std::cout << "opaque_len=" <<  opaque_len << std::endl;
   if (opaque_len != sizeof(T)) {
     throw std::invalid_argument( "received negative value" );
   }

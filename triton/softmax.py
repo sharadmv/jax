@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import triton
 import triton.language as tl
-import jax2triton as j2t
+import triton_call
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +42,7 @@ def softmax_kernel(
 def softmax(x: jnp.ndarray) -> jnp.ndarray:
   out_shape = SimpleNamespace(shape=x.shape, dtype=x.dtype)
   grid = lambda meta: (triton.cdiv(x.size, meta['BLOCK_SIZE']),)
-  return j2t.triton_call(x, kernel=softmax_kernel, out_shape=out_shape, grid=grid, BLOCK_SIZE=next_pow2(n))
+  return triton_call.triton_call(x, kernel=softmax_kernel, out_shape=out_shape, grid=grid, BLOCK_SIZE=next_pow2(n))
 
 n = 1024
 # x = jnp.arange(1024 * 512.).reshape(1024, 512)

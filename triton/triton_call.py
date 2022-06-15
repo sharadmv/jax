@@ -1,3 +1,4 @@
+import os
 import torch
 
 from typing import Any, Callable, Tuple, Union
@@ -15,8 +16,9 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
 import numpy as np
 
-import matt
 import custom_call
+
+os.environ["TRITON_CACHE_DIR"] = ""
 
 xc.register_custom_call_target("triton_call", custom_call.get_custom_call(), platform="CUDA")
 
@@ -53,37 +55,11 @@ def get_triton_python_ir(aval):
         return "scalar", get_triton_type(aval)
     return "ptr", get_triton_type(aval)
 
-@triton.jit
-def add_kernel(
-    x_ptr,  # *Pointer* to first input vector
-    y_ptr,  # *Pointer* to second input vector
-    output_ptr,  # *Pointer* to output vector
-    BLOCK_SIZE: tl.constexpr,
-):
-    # There are multiple 'program's processing different data. We identify which program
-    # we are here
-    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0
-    # This program will process inputs that are offset from the initial data.
-    # for instance, if you had a vector of length 256 and block_size of 64, the programs
-    # would each access the elements [0:64, 64:128, 128:192, 192:256].
-    # Note that offsets is a list of pointers
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    # Create a mask to guard memory operations against out-of-bounds accesses
-    mask = offsets < 8
-    # Load x and y from DRAM, masking out any extra elements in case the input is not a
-    # multiple of the block size
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    output = x + y
-    # Write x + y back to DRAM
-    tl.store(output_ptr + offsets, output, mask=mask)
-
-def compile(triton_function, constants, *, key, device=0):
+def compile(triton_function, constants, *, key, device=0, num_warps=4, num_stages=2):
     def lower(*args):
         arg_types = [get_triton_python_ir(a) for a in args]
-        # arg_types.append(get_triton_python_ir(args[1]))
-        triton_function._warmup(arg_types=arg_types, device=device, attributes={0: 16, 1: 16, 2: 16}, constants=constants, num_warps=4, num_stages=2, key=key, is_manual_warmup=True)
+        attributes = {i: 16 for i in range(len(args))}
+        triton_function._warmup(arg_types=arg_types, device=device, attributes=attributes, constants=constants, num_warps=num_warps, num_stages=num_stages, key=key, is_manual_warmup=True)
         pass
     return lower
 
@@ -109,7 +85,6 @@ def triton_call_impl(*args, kernel, out_shape, grid, **metaparams):
   args_torch = [j2t(x) for x in args]
   output_torch = torch.empty(out_shape.shape, dtype=table[out_shape.dtype.name],
                              device=torch.device('cuda:0'))
-  # n_elements = output_torch.numel()
   kernel[grid](*args_torch, output_torch, **metaparams)
   return t2j(output_torch)
 
@@ -121,19 +96,34 @@ def avals_to_layouts(avals):
   return ir.ArrayAttr.get([aval_to_layout(a) for a in avals])
 
 def aval_to_layout(aval):
-  arange = np.arange(aval.ndim, dtype='int64')[::-1]
+  arange = np.arange(aval.ndim, dtype='int64')[::-1].copy()
   return ir.DenseIntElementsAttr.get(arange, type=ir.IndexType.get())
 
-def emit_triton_call(triton_func, avals_in, avals_out):
+def emit_triton_call(triton_func, avals_in, avals_out, grid, num_warps, num_stages, **metaparams):
   aval_out, = avals_out
-  compile(triton_func, {3:8}, key="foo")(*avals_in, aval_out)
+  metadata = {triton_func.arg_names.index(k) : v for k, v in metaparams.items()}
+  compile(triton_func, metadata, num_warps=num_warps, num_stages=num_stages, key="foo")(*avals_in, aval_out)
   loaded_binary = triton_func.bin_cache["foo"]
-  return np.array(loaded_binary.kernel).tobytes()
+  kernel_ptr = loaded_binary.kernel
+  shared_mem = loaded_binary.shared_mem
+  grid_ = grid(metaparams)
+  grid_0 = grid_[0]
+  if len(grid_) == 1:
+    grid_1, grid_2 = 1, 1
+  elif len(grid_) == 2:
+    grid_1, grid_2 = grid_[1], 1
+  elif len(grid_) == 3:
+    grid_1, grid_2 = grid_[1], grid_[2]
+  else:
+    assert False
+  arity = len(avals_in) + 1
+  descriptor = custom_call.make_triton_call_descriptor(kernel_ptr, shared_mem, grid_0, grid_1, grid_2, num_warps, arity)
+  return descriptor
 
-def triton_call_lowering(ctx, *args, kernel, out_shape, grid, **metaparams):
+def triton_call_lowering(ctx, *args, kernel, out_shape, grid, num_warps=4, num_stages=2, **metaparams):
   out_type = ir.RankedTensorType.get(out_shape.shape, mlir.dtype_to_ir_type(out_shape.dtype))
   i32_type = ir.IntegerType.get_signless(32)
-  descriptor = emit_triton_call(kernel, ctx.avals_in, ctx.avals_out)
+  descriptor = emit_triton_call(kernel, ctx.avals_in, ctx.avals_out, grid, num_warps, num_stages, **metaparams)
   n_elems = ctx.avals_out[0].size
   out = mhlo.CustomCallOp(
             [out_type], args,
@@ -142,18 +132,7 @@ def triton_call_lowering(ctx, *args, kernel, out_shape, grid, **metaparams):
             backend_config=ir.StringAttr.get(descriptor),
             api_version=ir.IntegerAttr.get(i32_type, 1),
             called_computations=ir.ArrayAttr.get([]),
-            # operand_layouts=avals_to_layouts(ctx.avals_in + [core.ShapedArray((), jnp.int32)]),
             operand_layouts=avals_to_layouts(ctx.avals_in),
             result_layouts=avals_to_layouts(ctx.avals_out))
   return out.results
 mlir.register_lowering(triton_call_p, triton_call_lowering)
-
-def add(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-  out_shape = SimpleNamespace(shape=x.shape, dtype=x.dtype)
-  grid = lambda meta: (triton.cdiv(x.size, meta['BLOCK_SIZE']),)
-  return triton_call(x, y, kernel=add_kernel, out_shape=out_shape, grid=grid, BLOCK_SIZE=8)
-
-x = jnp.arange(8)
-y = jnp.arange(8, 16)
-print(add(x, y))
-print(jax.jit(add)(x, y))

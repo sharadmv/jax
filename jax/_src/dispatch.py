@@ -368,11 +368,20 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   axis_env = xla.AxisEnv(nreps, (), ())
   name_stack = util.new_name_stack(util.wrap_name(name, 'jit'))
   closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
+  from jax._src.lax.control_flow import for_loop
+  is_const_ref = [isinstance(c, for_loop.Ref) for c in consts]
+  consts, const_refs = util.partition_list(is_const_ref, consts)
   module_name = f"jit_{fun.__name__}"
   unordered_effects = [eff for eff in closed_jaxpr.effects
                        if eff not in core.ordered_effects]
   ordered_effects = [eff for eff in closed_jaxpr.effects
                      if eff in core.ordered_effects]
+  const_ref_avals = [v.aval for v in jaxpr.constvars if isinstance(v.aval,
+    for_loop.ShapedArrayRef)]
+  ref_avals = [v.aval for v in jaxpr.invars if isinstance(v.aval,
+    for_loop.ShapedArrayRef)]
+  num_refs = len([v for v in jaxpr.invars if isinstance(v.aval,
+    for_loop.ShapedArrayRef)])
   lowering_result = mlir.lower_jaxpr_to_module(
       module_name, closed_jaxpr,
       unordered_effects, ordered_effects, backend.platform,
@@ -380,12 +389,15 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   module, keepalive, host_callbacks = (
       lowering_result.module, lowering_result.keepalive,
       lowering_result.host_callbacks)
+  out_type = tuple(zip(ref_avals, [True] * num_refs)) + out_type
+  out_type = tuple(zip(const_ref_avals, [True] * len(const_ref_avals))) + out_type
   return XlaComputation(
       name, module, False, donated_invars, fun.in_type, out_type, nreps=nreps,
       device=device, backend=backend, tuple_args=tuple_args,
       in_avals=abstract_args, out_avals=out_avals,
       has_unordered_effects=bool(unordered_effects),
       ordered_effects=ordered_effects, kept_var_idx=kept_var_idx,
+      num_refs=num_refs, const_refs=const_refs,
       keepalive=keepalive, host_callbacks=host_callbacks)
 
 
@@ -722,6 +734,7 @@ def _execute_compiled(name: str, compiled: XlaExecutable,
                       result_handler: Callable,
                       has_unordered_effects: bool,
                       ordered_effects: List[core.Effect],
+                      const_refs: List[Any],
                       kept_var_idx, *args):
   device, = compiled.local_devices()
   args, env = input_handler(args) if input_handler else (args, None)
@@ -735,7 +748,19 @@ def _execute_compiled(name: str, compiled: XlaExecutable,
   out_bufs = unflatten(out_flat, output_buffer_counts)
   if ordered_effects or has_unordered_effects:
     out_bufs = token_handler(out_bufs)
-  return result_handler(env, out_bufs)
+  from jax._src.lax.control_flow import for_loop
+  num_refs = len([a for a in args if isinstance(a, for_loop.Ref)])
+  out = result_handler(env, out_bufs)
+  refs = tuple(const_refs) + args[:num_refs]
+  if refs:
+    ref_vals = out[-len(refs):]
+  else:
+    ref_vals = []
+  for ref, val in zip(refs, ref_vals):
+    ref.value = val
+  if refs:
+    out = out[:-len(refs)]
+  return out
 
 
 def _execute_replicated(name: str, compiled: XlaExecutable,
@@ -920,7 +945,9 @@ class XlaCompiledComputation(stages.XlaExecutable):
                            out_avals: Sequence[core.AbstractValue],
                            has_unordered_effects: bool,
                            ordered_effects: List[core.Effect],
-                           kept_var_idx: Set[int], keepalive: Optional[Any],
+                           kept_var_idx: Set[int],
+                           num_refs: int, const_refs: List[Any],
+                           keepalive: Optional[Any],
                            host_callbacks: List[Any]) -> XlaCompiledComputation:
     sticky_device = device
     input_handler = _input_handler(backend, in_type, out_type)
@@ -934,13 +961,17 @@ class XlaCompiledComputation(stages.XlaExecutable):
       compiled = compile_or_get_cached(backend, xla_computation, options,
                                        host_callbacks)
     buffer_counts = [aval_to_num_buffers(aval) for aval in out_avals]
+    if const_refs:
+      buffer_counts = [1] * len(const_refs) + buffer_counts
+    if num_refs:
+      buffer_counts = [1] * num_refs + buffer_counts
     if ordered_effects or has_unordered_effects:
       num_output_tokens = len(ordered_effects) + has_unordered_effects
       buffer_counts = ([1] * num_output_tokens) + buffer_counts
     execute = _execute_compiled if nreps == 1 else _execute_replicated
     unsafe_call = partial(execute, name, compiled, input_handler, buffer_counts,  # type: ignore  # noqa: F811
                           result_handler, has_unordered_effects,
-                          ordered_effects, kept_var_idx)
+                          ordered_effects, const_refs, kept_var_idx)
     return XlaCompiledComputation(compiled, in_avals, kept_var_idx, unsafe_call,
                                   keepalive)
 

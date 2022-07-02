@@ -551,6 +551,10 @@ def lower_jaxpr_to_module(
   Handles the quirks of the argument/return value passing conventions of the
   runtime.
   """
+  from jax._src.lax.control_flow import for_loop
+  if for_loop.State in jaxpr.effects:
+    jaxpr, consts = for_loop.discharge_state(jaxpr.jaxpr, jaxpr.consts)
+    jaxpr = core.ClosedJaxpr(jaxpr, consts)
   platform = xb.canonicalize_platform(platform)
   if not xb.is_known_platform(platform):
     raise ValueError(f"Unknown platform {platform}")

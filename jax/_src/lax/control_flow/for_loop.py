@@ -15,7 +15,7 @@
 from functools import partial
 import operator
 
-from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar, Union
 
 from jax import core
 from jax import lax
@@ -32,12 +32,16 @@ from jax._src import ad_util
 from jax._src import dtypes
 from jax._src import pretty_printer as pp
 from jax._src import source_info_util
-from jax._src.util import (partition_list, merge_lists, safe_map, safe_zip,
-                           split_list)
+from jax._src.util import safe_map, safe_zip, split_list, partition_list, merge_lists
 import jax.numpy as jnp
 
 from jax._src.lax.control_flow import loops
 from jax._src.lax.control_flow.common import _abstractify, _initial_style_jaxpr
+from jax._src.lib import xla_bridge, xla_client
+from jax._src import device_array
+
+xc = xla_client
+xb = xla_bridge
 
 ## JAX utilities
 
@@ -314,10 +318,13 @@ ad.primitive_transposes[swap_p] = _swap_transpose
 
 def discharge_state(jaxpr: core.Jaxpr, consts: Sequence[Any]) -> Tuple[core.Jaxpr, List[Any]]:
   """Converts a jaxpr that takes in `Ref`s into one that doesn't."""
+  is_const_ref = [isinstance(c, Ref) for c in consts]
+  consts = [c.value if ref else c for c, ref in zip(consts, is_const_ref)]
   in_avals = [core.ShapedArray(v.aval.shape, v.aval.dtype)
               if type(v.aval) is ShapedArrayRef
               else v.aval for v in jaxpr.invars]
-  eval_jaxpr = lu.wrap_init(partial(_eval_jaxpr_discharge_state, jaxpr, consts))
+  eval_jaxpr = lu.wrap_init(partial(_eval_jaxpr_discharge_state, jaxpr,
+    is_const_ref, consts))
   new_jaxpr, _ , new_consts = pe.trace_to_jaxpr_dynamic(eval_jaxpr, in_avals)
   return new_jaxpr, new_consts
 
@@ -336,7 +343,8 @@ def _dynamic_update_index(x, idx, val):
   update = val.reshape((1,) * len(idx) + x.shape[len(idx):])
   return lax.dynamic_update_slice(x, update, starts)
 
-def _eval_jaxpr_discharge_state(jaxpr: core.Jaxpr, consts: Sequence[Any],
+def _eval_jaxpr_discharge_state(jaxpr: core.Jaxpr,
+                                is_const_ref, consts,
                                 *args: Any):
   env: Dict[core.Var, Any] = {}
 
@@ -391,9 +399,11 @@ def _eval_jaxpr_discharge_state(jaxpr: core.Jaxpr, consts: Sequence[Any],
   # values of the `Ref`s. Callers to this function should be able to split
   # them up by looking at `len(jaxpr.outvars)`.
   out_vals = map(read, jaxpr.outvars)
+  const_ref_vals = map(
+      read, [v for v in jaxpr.constvars if type(v.aval) is ShapedArrayRef])
   ref_vals = map(
       read, [v for v in jaxpr.invars if type(v.aval) is ShapedArrayRef])
-  return out_vals + ref_vals
+  return out_vals + const_ref_vals + ref_vals
 
 ## `for_loop` implementation
 
@@ -831,3 +841,103 @@ def discharged_for_loop(nsteps, body, init_state, *, reverse: bool = False):
     return out_flat
   out_flat = loops.fori_loop(0, nsteps, fori_body, flat_state)
   return tree_unflatten(state_tree, out_flat)
+
+# ## `Ref`s
+
+from jax._src import dispatch
+
+class Ref:
+
+  def __init__(self, value):
+    self.value = jnp.array(value)
+    self.aval = ShapedArrayRef(self.value.shape, self.value.dtype)
+
+  def get(self):
+    return ref_get(self, ())
+
+  def __getitem__(self, idx):
+    return ref_get(self, idx)
+
+  def __iadd__(self, value):
+    val = ref_get(self, ()) + value
+    ref_set(self, (), val)
+    return val
+
+  def __getattr__(self, name):
+    return getattr(self.value, name)
+
+  def __repr__(self):
+    return f"Ref<{self.value}>"
+
+
+def make_device_array(
+    aval: ShapedArrayRef,
+    device: Optional[xc.Device],
+    device_buffer: xc.Buffer,
+) -> Union[xc.Buffer, device_array._DeviceArray]:
+  """Returns a DeviceArray implementation based on arguments.
+
+  This is to be used only within JAX. It will return either a PythonDeviceArray
+  or a C++ equivalent implementation.
+  """
+  if isinstance(device_buffer, xc.Buffer):
+
+    if device_buffer.aval == aval and device_buffer._device == device:
+      return device_buffer
+    device_buffer = device_buffer.clone()
+    device_buffer._device = device
+    device_buffer.aval = aval
+    return device_buffer
+
+  return device_array._DeviceArray(aval, device, device_buffer)
+
+def to_shaped_array(shaped_array_ref):
+  return core.ShapedArray(shaped_array_ref.shape, shaped_array_ref.dtype)
+
+def ref_result_handler(device, aval):
+  return lambda _, value: make_device_array(aval, device, value)
+  
+
+def ref_shape_handler(a):
+  return (
+    xc.Shape.array_shape(a.aval.dtype, a.aval.shape),
+  )
+
+def ref_device_put_handler(a, device):
+  return (xb.get_device_backend(device).buffer_from_pyval(a.value, device),)
+
+
+core.pytype_aval_mappings[Ref] = lambda x: x.aval
+xla.pytype_aval_mappings[Ref] = lambda x: x.aval
+xla.canonicalize_dtype_handlers[Ref] = lambda x: x
+dispatch.device_put_handlers[Ref] = ref_device_put_handler
+dispatch.result_handlers[ShapedArrayRef] = ref_result_handler
+dispatch.num_buffers_handlers[ShapedArrayRef] = lambda _: 1
+xla.xla_shape_handlers[ShapedArrayRef] = ref_shape_handler
+mlir.lowerable_effects.add(State)
+mlir.ir_type_handlers[ShapedArrayRef]  = mlir._array_ir_types
+
+def get_lowering_rule(ctx, ref, *idx):
+  def _lower(ref, *idx):
+    return _dynamic_index(ref, idx)
+  ctx = ctx.replace(avals_in=[to_shaped_array(ctx.avals_in[0]), *ctx.avals_in[1:]])
+  return mlir.lower_fun(_lower, multiple_results=False)(ctx, ref, *idx)
+mlir.register_lowering(get_p, get_lowering_rule)
+
+def swap_lowering_rule(ctx, ref, value, *idx):
+  def _lower(ref, value, *idx):
+    return _dynamic_update_index(ref, idx, value)
+  ctx = ctx.replace(avals_in=[to_shaped_array(ctx.avals_in[0]), *ctx.avals_in[1:]])
+  return mlir.lower_fun(_lower, multiple_results=False)(ctx, ref, *idx, value)
+mlir.register_lowering(swap_p, swap_lowering_rule)
+
+@get_p.def_impl
+def get_impl(ref, *idx):
+  return ref.value[idx]
+
+@swap_p.def_impl
+def swap_impl(ref, value, *idx):
+  old = ref.value.at[idx]
+  ref.value = ref.value.at[idx].set(value)
+  return old
+

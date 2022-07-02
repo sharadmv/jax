@@ -554,7 +554,7 @@ def _cpp_jit(
     ### If we can use the fastpath, we return required info to the caller.
     if use_fastpath:
       (_, xla_executable,
-       _, _, result_handlers, _, _, kept_var_idx) = execute.args
+       _, _, result_handlers, _, _, _, kept_var_idx) = execute.args
       sticky_device = None
       avals = []
       lazy_exprs = [None] * len(result_handlers)

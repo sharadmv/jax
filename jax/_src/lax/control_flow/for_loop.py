@@ -851,6 +851,8 @@ class Ref:
   def __init__(self, value):
     self.value = jnp.array(value)
     self.aval = ShapedArrayRef(self.value.shape, self.value.dtype)
+    self.shape = self.value.shape
+    self.dtype = self.value.dtype
 
   def get(self):
     return ref_get(self, ())
@@ -858,10 +860,18 @@ class Ref:
   def __getitem__(self, idx):
     return ref_get(self, idx)
 
+  def __add__(self, other):
+    return self[()] + other
+
   def __iadd__(self, value):
     val = ref_get(self, ()) + value
     ref_set(self, (), val)
-    return val
+    return self
+
+  def __isub__(self, value):
+    val = ref_get(self, ()) - value
+    ref_set(self, (), val)
+    return self
 
   def __getattr__(self, name):
     return getattr(self.value, name)

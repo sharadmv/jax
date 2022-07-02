@@ -4,6 +4,7 @@ import abc
 import dataclasses
 
 from jax._src.lax.control_flow import for_loop
+from jax import random
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +38,7 @@ class Module(metaclass=ModuleMeta):
   def __setattr__(self, name, value):
     if hasattr(self, name):
       ref = getattr(self, name)
-      if isinstance(ref, Ref):
+      if isinstance(ref, Ref) and not isinstance(value, Ref):
         ref_set(ref, (), value)
         return
     super().__setattr__(name, value)
@@ -47,7 +48,8 @@ class Module(metaclass=ModuleMeta):
       dynamic_field_values = []
       static_field_names = []
       static_field_values = []
-      for field_ in fields(self):
+      print("FOO")
+      for field_ in dataclasses.fields(self):
           name = field_.name
           try:
               value = self.__dict__[name]
@@ -83,10 +85,45 @@ class Counter(Module):
 
   def __call__(self, x):
     self.count += 1
-    return self.count[()] + x
+    return self.count + x
 
 counter = Counter()
 def inc(x):
   return counter(x)
 print(inc(1))
 print(jax.jit(inc)(1))
+
+
+# # `BatchNorm`
+
+class BatchNorm(Module):
+  beta: jnp.ndarray
+  gamma: jnp.ndarray
+  mean: Ref
+  var: Ref
+
+  def __init__(self, dim, *, key, momentum=0.99, eps=1e-3):
+    del key
+    self.beta, self.gamma = jnp.zeros(dim), jnp.ones(dim)
+    self.mean = Ref(jnp.zeros(dim))
+    self.var = Ref(jnp.ones(dim))
+    self.momentum = momentum
+    self.eps = eps
+
+  def __call__(self, xs):
+    batch_mean, batch_var = jnp.mean(xs, axis=0), jnp.var(xs, axis=0)
+    mean, var = self.mean[()], self.var[()]
+    zs = (xs - mean[None]) / jnp.sqrt(var[None] + self.eps)
+    ys = zs * self.gamma[None] + self.beta[None]
+    self.mean = mean* self.momentum + batch_mean * (1 - self.momentum)
+    self.var = var * self.momentum + batch_var * (1 - self.momentum)
+    return ys
+
+bn = BatchNorm(5, key=random.PRNGKey(0), momentum=0.1)
+print(bn.mean, bn.var)
+bn(jnp.arange(10.).reshape((2, 5)))
+print(bn.mean, bn.var)
+print(jnp.arange(10.).reshape((2, 5)))
+for _ in range(100):
+  jax.jit(bn)(jnp.arange(10.).reshape((2, 5)))
+print(bn.mean, bn.var)

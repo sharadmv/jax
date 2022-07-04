@@ -389,8 +389,9 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   module, keepalive, host_callbacks = (
       lowering_result.module, lowering_result.keepalive,
       lowering_result.host_callbacks)
-  out_type = tuple(zip(ref_avals, [True] * num_refs)) + out_type
-  out_type = tuple(zip(const_ref_avals, [True] * len(const_ref_avals))) + out_type
+  ref_out_type = tuple(zip(ref_avals, [True] * num_refs))
+  ref_out_type = tuple(zip(const_ref_avals, [True] * len(const_ref_avals))) + ref_out_type
+  out_type = out_type + ref_out_type
   return XlaComputation(
       name, module, False, donated_invars, fun.in_type, out_type, nreps=nreps,
       device=device, backend=backend, tuple_args=tuple_args,

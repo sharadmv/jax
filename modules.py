@@ -35,9 +35,15 @@ class ModuleMeta(abc.ABCMeta):
 
 class Module(metaclass=ModuleMeta):
 
+  def __getattribute__(self, name):
+    obj = super().__getattribute__(name)
+    if isinstance(obj, Ref):
+      return ref_get(obj, ())
+    return obj
+
   def __setattr__(self, name, value):
     if hasattr(self, name):
-      ref = getattr(self, name)
+      ref = super().__getattribute__(name)
       if isinstance(ref, Ref) and not isinstance(value, Ref):
         ref_set(ref, (), value)
         return
@@ -48,7 +54,6 @@ class Module(metaclass=ModuleMeta):
       dynamic_field_values = []
       static_field_names = []
       static_field_values = []
-      print("FOO")
       for field_ in dataclasses.fields(self):
           name = field_.name
           try:
@@ -112,11 +117,10 @@ class BatchNorm(Module):
 
   def __call__(self, xs):
     batch_mean, batch_var = jnp.mean(xs, axis=0), jnp.var(xs, axis=0)
-    mean, var = self.mean[()], self.var[()]
-    zs = (xs - mean[None]) / jnp.sqrt(var[None] + self.eps)
+    zs = (xs - self.mean[None]) / jnp.sqrt(self.var[None] + self.eps)
     ys = zs * self.gamma[None] + self.beta[None]
-    self.mean = mean* self.momentum + batch_mean * (1 - self.momentum)
-    self.var = var * self.momentum + batch_var * (1 - self.momentum)
+    self.mean = self.mean* self.momentum + batch_mean * (1 - self.momentum)
+    self.var = self.var * self.momentum + batch_var * (1 - self.momentum)
     return ys
 
 bn = BatchNorm(5, key=random.PRNGKey(0), momentum=0.1)
@@ -127,3 +131,5 @@ print(jnp.arange(10.).reshape((2, 5)))
 for _ in range(100):
   jax.jit(bn)(jnp.arange(10.).reshape((2, 5)))
 print(bn.mean, bn.var)
+
+print(jax.tree_leaves(bn))

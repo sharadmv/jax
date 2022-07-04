@@ -141,11 +141,12 @@ def ref_addupdate(ref: Ref, idx: Tuple[int], x: Array) -> None:
 # We need an aval for `Ref`s so we can represent `get` and `swap` in Jaxprs.
 # A `ShapedArrayRef` is a abstract value for mutable containers of array types
 class ShapedArrayRef(core.AbstractValue):
-  __slots__ = ["shape", "dtype"]
+  __slots__ = ["shape", "dtype", "weak_type"]
 
-  def __init__(self, shape, dtype):
+  def __init__(self, shape, dtype, weak_type):
     self.shape = shape
     self.dtype = dtype
+    self.weak_type = weak_type
 
   def join(self, other):
     assert core.symbolic_equal_shape(self.shape, other.shape)
@@ -174,7 +175,8 @@ core.raise_to_shaped_mappings[ShapedArrayRef] = lambda aval, _: aval
 def _get_abstract_eval(ref_aval: ShapedArrayRef, *idx: int):
   if not isinstance(ref_aval, ShapedArrayRef):
     raise ValueError(f"`get` must be called on `Ref` types: {ref_aval}.")
-  return core.ShapedArray(ref_aval.shape[len(idx):], ref_aval.dtype), {State}
+  return core.ShapedArray(ref_aval.shape[len(idx):], ref_aval.dtype,
+      ref_aval.weak_type), {State}
 get_p.def_effectful_abstract_eval(_get_abstract_eval)
 
 
@@ -320,7 +322,7 @@ def discharge_state(jaxpr: core.Jaxpr, consts: Sequence[Any]) -> Tuple[core.Jaxp
   """Converts a jaxpr that takes in `Ref`s into one that doesn't."""
   is_const_ref = [isinstance(c, Ref) for c in consts]
   consts = [c.value if ref else c for c, ref in zip(consts, is_const_ref)]
-  in_avals = [core.ShapedArray(v.aval.shape, v.aval.dtype)
+  in_avals = [core.ShapedArray(v.aval.shape, v.aval.dtype, v.aval.weak_type)
               if type(v.aval) is ShapedArrayRef
               else v.aval for v in jaxpr.invars]
   eval_jaxpr = lu.wrap_init(partial(_eval_jaxpr_discharge_state, jaxpr,
@@ -424,7 +426,8 @@ def _hoist_consts_to_refs(jaxpr: core.Jaxpr) -> core.Jaxpr:
     consts = [r[()] for r in const_refs]
     return core.eval_jaxpr(jaxpr, consts, i, *args)
   assert all(isinstance(var.aval, core.ShapedArray) for var in jaxpr.constvars)
-  const_avals = [ShapedArrayRef(var.aval.shape, var.aval.dtype) for var in  # pytype: disable=attribute-error
+  const_avals = [ShapedArrayRef(var.aval.shape, var.aval.dtype,
+    var.aval.weak_type) for var in  # pytype: disable=attribute-error
                  jaxpr.constvars]
   i_aval, *arg_avals = [var.aval for var in jaxpr.invars]
   in_avals = [i_aval, *const_avals, *arg_avals]
@@ -446,7 +449,7 @@ def val_to_ref_aval(x) -> ShapedArrayRef:
   aval = core.raise_to_shaped(core.get_aval(x))
   if type(aval) is not core.ShapedArray:
     raise Exception(f"can't make ref from {x}")
-  return ShapedArrayRef(aval.shape, aval.dtype)
+  return ShapedArrayRef(aval.shape, aval.dtype, aval.weak_type)
 
 def for_loop(nsteps: int, body: Callable[[Array, Ref[S]], None], init_state: S,
              *, reverse: bool = False) -> S:
@@ -850,7 +853,7 @@ class Ref:
 
   def __init__(self, value):
     self.value = jnp.array(value)
-    self.aval = ShapedArrayRef(self.value.shape, self.value.dtype)
+    self.aval = ShapedArrayRef(self.value.shape, self.value.dtype, False)
     self.shape = self.value.shape
     self.dtype = self.value.dtype
 
@@ -890,6 +893,7 @@ def make_device_array(
   This is to be used only within JAX. It will return either a PythonDeviceArray
   or a C++ equivalent implementation.
   """
+  aval = core.ShapedArray(aval.shape, aval.dtype, aval.weak_type)
   if isinstance(device_buffer, xc.Buffer):
 
     if device_buffer.aval == aval and device_buffer._device == device:
@@ -902,7 +906,8 @@ def make_device_array(
   return device_array._DeviceArray(aval, device, device_buffer)
 
 def to_shaped_array(shaped_array_ref):
-  return core.ShapedArray(shaped_array_ref.shape, shaped_array_ref.dtype)
+  return core.ShapedArray(shaped_array_ref.shape, shaped_array_ref.dtype,
+      shaped_array_ref.weak_type)
 
 def ref_result_handler(device, aval):
   return lambda _, value: make_device_array(aval, device, value)

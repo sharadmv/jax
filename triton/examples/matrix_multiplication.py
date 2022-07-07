@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import triton
 import triton.language as tl
-import triton_call
+import jax_triton as jt
 
 import jax
 import jax.numpy as jnp
@@ -115,7 +115,7 @@ def matmul(a, b, activation=None):
     grid = lambda META: (
         triton.cdiv(m, META['BLOCK_SIZE_M']) * triton.cdiv(n, META['BLOCK_SIZE_N']),
     )
-    return triton_call.triton_call(a, b, kernel=matmul_kernel, out_shape=out_shape, grid=grid, 
+    return jt.triton_call(a, b, kernel=matmul_kernel, out_shape=out_shape, grid=grid, 
             num_warps=8, num_stages=3,
 	    BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
 	    GROUP_SIZE_M=GROUP_SIZE_M, ACTIVATION=activation)

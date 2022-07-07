@@ -16,7 +16,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
 import numpy as np
 
-import custom_call
+from jax_triton import custom_call
 
 os.environ["TRITON_CACHE_DIR"] = ""
 

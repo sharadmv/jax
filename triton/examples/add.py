@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import triton
 import triton.language as tl
-import triton_call
+import jax_triton as jt
 
 import jax
 import jax.numpy as jnp
@@ -38,7 +38,7 @@ def add_kernel(
 def add(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
   out_shape = SimpleNamespace(shape=x.shape, dtype=x.dtype)
   grid = lambda meta: (triton.cdiv(x.size, meta['BLOCK_SIZE']),)
-  return triton_call.triton_call(x, y, kernel=add_kernel, out_shape=out_shape, grid=grid, BLOCK_SIZE=8)
+  return jt.triton_call(x, y, kernel=add_kernel, out_shape=out_shape, grid=grid, BLOCK_SIZE=8)
 
 x = jnp.arange(8)
 y = jnp.arange(8, 16)

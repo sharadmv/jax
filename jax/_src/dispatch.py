@@ -389,6 +389,7 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   module, keepalive, host_callbacks = (
       lowering_result.module, lowering_result.keepalive,
       lowering_result.host_callbacks)
+  print("LOWERED", closed_jaxpr)
   ref_out_type = tuple(zip(ref_avals, [True] * num_refs))
   ref_out_type = tuple(zip(const_ref_avals, [True] * len(const_ref_avals))) + ref_out_type
   out_type = out_type + ref_out_type

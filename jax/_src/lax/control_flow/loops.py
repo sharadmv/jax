@@ -272,6 +272,7 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
     raise NotImplementedError(
         f'Effects not supported in `scan`: {disallowed_effects}')
 
+  print("SCAN JAXPR", jaxpr)
   out = scan_p.bind(*consts, *in_flat,
                     reverse=reverse, length=length, jaxpr=jaxpr,
                     num_consts=len(consts), num_carry=len(init_flat),

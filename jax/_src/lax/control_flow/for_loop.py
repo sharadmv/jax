@@ -36,7 +36,7 @@ from jax._src.util import safe_map, safe_zip, split_list, partition_list, merge_
 import jax.numpy as jnp
 
 from jax._src.lax.control_flow import loops
-from jax._src.lax.control_flow.common import _abstractify, _initial_style_jaxpr
+from jax._src.lax.control_flow.common import _abstractify, _initial_style_jaxpr, allowed_effects
 from jax._src.lib import xla_bridge, xla_client
 from jax._src import device_array
 
@@ -58,6 +58,8 @@ Array = Any
 
 class StateEffect: pass
 State = StateEffect()
+
+allowed_effects.add(State)
 
 ## get/swap/addupdate implementations
 

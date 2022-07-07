@@ -2,12 +2,16 @@
 
 import abc
 import dataclasses
+import functools
 
+from jax.config import config
 from jax._src.lax.control_flow import for_loop
 from jax import random
 
 import jax
 import jax.numpy as jnp
+
+config.update("jax_traceback_filtering", "off")
 
 Ref = for_loop.Ref
 ref_get = for_loop.ref_get
@@ -106,17 +110,20 @@ class BatchNorm(Module):
   gamma: jnp.ndarray
   mean: Ref
   var: Ref
+  eps: float
+  axis: str
 
-  def __init__(self, dim, *, key, momentum=0.99, eps=1e-3):
+  def __init__(self, dim, *, key, momentum=0.99, eps=1e-3, axis=0):
     del key
     self.beta, self.gamma = jnp.zeros(dim), jnp.ones(dim)
     self.mean = Ref(jnp.zeros(dim))
     self.var = Ref(jnp.ones(dim))
     self.momentum = momentum
     self.eps = eps
+    self.axis = axis
 
   def __call__(self, xs):
-    batch_mean, batch_var = jnp.mean(xs, axis=0), jnp.var(xs, axis=0)
+    batch_mean, batch_var = jnp.mean(xs, axis=[self.axis]), jnp.var(xs, axis=[self.axis])
     zs = (xs - self.mean[None]) / jnp.sqrt(self.var[None] + self.eps)
     ys = zs * self.gamma[None] + self.beta[None]
     self.mean = self.mean* self.momentum + batch_mean * (1 - self.momentum)
@@ -133,3 +140,14 @@ for _ in range(100):
 print(bn.mean, bn.var)
 
 print(jax.tree_leaves(bn))
+
+ref = Ref(1.)
+
+def body(_, x):
+  ref_set(ref, (), ref_get(ref, ()) + x)
+  return (), ()
+print(jax.make_jaxpr(body)((), 1.))
+# print(bn2.mean, bn2.var)
+
+print(jax.make_jaxpr(lambda x: jax.lax.scan(body, (), x))(jnp.ones(5)))
+jax.lax.scan(body, (), jnp.ones(5))

@@ -25,7 +25,7 @@ $ pytest test/unit
 $ git clone https://github.com/sharadmv/jax.git
 $ cd jax
 $ git checkout triton
-$ pip install -e ".[cuda11_cudnn805]" -f https://storage.googleapis.com/jax-releases/jax_releases.html
+$ pip install -e ".[cuda11_cudnn82]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 $ pip install pybind11
 $ cd triton
 $ make # compiles our custom call

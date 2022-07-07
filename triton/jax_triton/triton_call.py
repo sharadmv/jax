@@ -8,17 +8,23 @@ import jax
 import jax.dlpack
 from jax import core
 import jax.numpy as jnp
-import triton
-import triton.language as tl
 from jax.lib import xla_client as xc
 from jax.interpreters import mlir
+from jax import tree_util
+from jax._src import util
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
+
 import numpy as np
+
+import triton
+import triton.language as tl
 
 from jax_triton import custom_call
 
 os.environ["TRITON_CACHE_DIR"] = ""
+map, unsafe_map = util.safe_map, map
+zip, unsafe_zip = util.safe_zip, zip
 
 xc.register_custom_call_target("triton_call", custom_call.get_custom_call(), platform="CUDA")
 
@@ -76,21 +82,27 @@ Metaparameters = Any
 ShapeDtypeDuck = Any
 
 triton_call_p = jax.core.Primitive('triton_call')
-triton_call = triton_call_p.bind
+triton_call_p.multiple_results = True
+
+def triton_call(*args, kernel, out_shape, grid, num_warps=4, num_stages=2, **metaparams):
+  flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
+  out_flat = triton_call_p.bind(*args, kernel=kernel, out_shapes=flat_out_shapes,
+      grid=grid, num_warps=num_warps, num_stages=num_stages, **metaparams)
+  return tree_util.tree_unflatten(out_tree, out_flat)
 
 table = {'float32': torch.float32, 'int32': torch.int32}
 
 @triton_call_p.def_impl
-def triton_call_impl(*args, kernel, out_shape, grid, **metaparams):
+def triton_call_impl(*args, kernel, out_shapes, grid, **metaparams):
   args_torch = [j2t(x) for x in args]
-  output_torch = torch.empty(out_shape.shape, dtype=table[out_shape.dtype.name],
-                             device=torch.device('cuda:0'))
-  kernel[grid](*args_torch, output_torch, **metaparams)
-  return t2j(output_torch)
+  outputs_torch = [torch.empty(out_shape.shape, dtype=table[out_shape.dtype.name],
+                   device=torch.device('cuda:0')) for out_shape in out_shapes]
+  kernel[grid](*args_torch, *outputs_torch, **metaparams)
+  return map(t2j, outputs_torch)
 
 @triton_call_p.def_abstract_eval
-def triton_call_abstract_eval(*_, out_shape, **__):
-  return core.ShapedArray(out_shape.shape, out_shape.dtype)
+def triton_call_abstract_eval(*_, out_shapes, **__):
+  return [core.ShapedArray(out_shape.shape, out_shape.dtype) for out_shape in out_shapes]
 
 def avals_to_layouts(avals):
   return ir.ArrayAttr.get([aval_to_layout(a) for a in avals])
@@ -100,9 +112,8 @@ def aval_to_layout(aval):
   return ir.DenseIntElementsAttr.get(arange, type=ir.IndexType.get())
 
 def emit_triton_call(triton_func, avals_in, avals_out, grid, num_warps, num_stages, **metaparams):
-  aval_out, = avals_out
   metadata = {triton_func.arg_names.index(k) : v for k, v in metaparams.items()}
-  compile(triton_func, metadata, num_warps=num_warps, num_stages=num_stages, key="foo")(*avals_in, aval_out)
+  compile(triton_func, metadata, num_warps=num_warps, num_stages=num_stages, key="foo")(*avals_in, *avals_out)
   loaded_binary = triton_func.bin_cache["foo"]
   kernel_ptr = loaded_binary.kernel
   shared_mem = loaded_binary.shared_mem
@@ -116,12 +127,14 @@ def emit_triton_call(triton_func, avals_in, avals_out, grid, num_warps, num_stag
     grid_1, grid_2 = grid_[1], grid_[2]
   else:
     assert False
-  arity = len(avals_in) + 1
+  arity = len(avals_in) + len(avals_out)
   descriptor = custom_call.make_triton_call_descriptor(kernel_ptr, shared_mem, grid_0, grid_1, grid_2, num_warps, arity)
   return descriptor
 
-def triton_call_lowering(ctx, *args, kernel, out_shape, grid, num_warps=4, num_stages=2, **metaparams):
-  out_type = ir.RankedTensorType.get(out_shape.shape, mlir.dtype_to_ir_type(out_shape.dtype))
+def triton_call_lowering(ctx, *args, kernel, out_shapes, grid, num_warps=4, num_stages=2, **metaparams):
+  out_type = ir.TupleType.get_tuple([
+      ir.RankedTensorType.get(out_shape.shape, mlir.dtype_to_ir_type(out_shape.dtype))
+      for out_shape in out_shapes])
   i32_type = ir.IntegerType.get_signless(32)
   descriptor = emit_triton_call(kernel, ctx.avals_in, ctx.avals_out, grid, num_warps, num_stages, **metaparams)
   n_elems = ctx.avals_out[0].size
@@ -134,5 +147,7 @@ def triton_call_lowering(ctx, *args, kernel, out_shape, grid, num_warps=4, num_s
             called_computations=ir.ArrayAttr.get([]),
             operand_layouts=avals_to_layouts(ctx.avals_in),
             result_layouts=avals_to_layouts(ctx.avals_out))
-  return out.results
+  results = [mhlo.GetTupleElementOp(out, mlir.i32_attr(i)).result
+             for i in range(len(out_shapes))]
+  return results
 mlir.register_lowering(triton_call_p, triton_call_lowering)

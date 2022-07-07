@@ -31,6 +31,7 @@ xc.register_custom_call_target("triton_call", custom_call.get_custom_call(), pla
 def get_triton_type(obj: Any) -> str:
     type_map = {
         jnp.dtype("float32"): "f32",
+        jnp.dtype("float16"): "f16",
         jnp.dtype("int32"): "i32",
     }
     if isinstance(obj, jax.core.ShapedArray):
@@ -90,7 +91,7 @@ def triton_call(*args, kernel, out_shape, grid, num_warps=4, num_stages=2, **met
       grid=grid, num_warps=num_warps, num_stages=num_stages, **metaparams)
   return tree_util.tree_unflatten(out_tree, out_flat)
 
-table = {'float32': torch.float32, 'int32': torch.int32}
+table = {'float32': torch.float32, 'int32': torch.int32, 'float16': torch.float16}
 
 @triton_call_p.def_impl
 def triton_call_impl(*args, kernel, out_shapes, grid, **metaparams):
@@ -137,7 +138,6 @@ def triton_call_lowering(ctx, *args, kernel, out_shapes, grid, num_warps=4, num_
       for out_shape in out_shapes])
   i32_type = ir.IntegerType.get_signless(32)
   descriptor = emit_triton_call(kernel, ctx.avals_in, ctx.avals_out, grid, num_warps, num_stages, **metaparams)
-  n_elems = ctx.avals_out[0].size
   out = mhlo.CustomCallOp(
             [out_type], args,
             call_target_name=ir.StringAttr.get("triton_call"),

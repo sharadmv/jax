@@ -1,4 +1,3 @@
-// g++ custom_call.cc -o custom_call.so -lcuda -shared -fPIC $(python -m pybind11 --includes)
 #include <iostream>
 #include <string>
 

@@ -1737,7 +1737,6 @@ class DynamicJaxprTrace(core.Trace):
     return tracer
 
   def new_const(self, c):
-    print("NEW CONST", c)
     # TODO(mattjj): for ints, or hashable consts, don't rely on id
     tracer = self.frame.constid_to_tracer.get(id(c))
     if tracer is None:
@@ -1748,7 +1747,6 @@ class DynamicJaxprTrace(core.Trace):
   pure = lift = new_const
 
   def _new_const(self, aval, c):
-    print("_NEW CONST", aval, c)
     tracer = DynamicJaxprTracer(self, aval, source_info_util.current())
     self.frame.tracers.append(tracer)
     self.frame.tracer_to_var[id(tracer)] = var = self.frame.newvar(aval)

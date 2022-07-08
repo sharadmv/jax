@@ -45,6 +45,7 @@ from jax._src import device_array
 from jax._src import dtypes
 from jax._src import profiler
 from jax._src import stages
+from jax._src import state
 from jax._src import traceback_util
 from jax._src.abstract_arrays import array_types
 from jax._src.config import config, flags
@@ -368,8 +369,7 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   axis_env = xla.AxisEnv(nreps, (), ())
   name_stack = util.new_name_stack(util.wrap_name(name, 'jit'))
   closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
-  from jax._src.lax.control_flow import for_loop
-  is_const_ref = [isinstance(c, for_loop.Ref) for c in consts]
+  is_const_ref = [isinstance(c, state.Ref) for c in consts]
   consts, const_refs = util.partition_list(is_const_ref, consts)
   module_name = f"jit_{fun.__name__}"
   unordered_effects = [eff for eff in closed_jaxpr.effects
@@ -377,11 +377,11 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   ordered_effects = [eff for eff in closed_jaxpr.effects
                      if eff in core.ordered_effects]
   const_ref_avals = [v.aval for v in jaxpr.constvars if isinstance(v.aval,
-    for_loop.ShapedArrayRef)]
+    state.AbstractRef)]
   ref_avals = [v.aval for v in jaxpr.invars if isinstance(v.aval,
-    for_loop.ShapedArrayRef)]
+    state.AbstractRef)]
   num_refs = len([v for v in jaxpr.invars if isinstance(v.aval,
-    for_loop.ShapedArrayRef)])
+    state.AbstractRef)])
   lowering_result = mlir.lower_jaxpr_to_module(
       module_name, closed_jaxpr,
       unordered_effects, ordered_effects, backend.platform,
@@ -389,7 +389,6 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   module, keepalive, host_callbacks = (
       lowering_result.module, lowering_result.keepalive,
       lowering_result.host_callbacks)
-  print("LOWERED", closed_jaxpr)
   ref_out_type = tuple(zip(ref_avals, [True] * num_refs))
   ref_out_type = tuple(zip(const_ref_avals, [True] * len(const_ref_avals))) + ref_out_type
   out_type = out_type + ref_out_type
@@ -750,8 +749,7 @@ def _execute_compiled(name: str, compiled: XlaExecutable,
   out_bufs = unflatten(out_flat, output_buffer_counts)
   if ordered_effects or has_unordered_effects:
     out_bufs = token_handler(out_bufs)
-  from jax._src.lax.control_flow import for_loop
-  num_refs = len([a for a in args if isinstance(a, for_loop.Ref)])
+  num_refs = len([a for a in args if isinstance(a, state.Ref)])
   out = result_handler(env, out_bufs)
   refs = tuple(const_refs) + args[:num_refs]
   if refs:
@@ -1115,3 +1113,15 @@ def _device_put_lowering(ctx, x, *, device):
 
 
 mlir.register_lowering(device_put_p, _device_put_lowering)
+
+def ref_result_handler(device, aval):
+  return lambda _, value: state.Ref(
+      device_array.make_device_array(aval, device, value))
+  
+def ref_device_put_handler(a, device):
+  return (xb.get_device_backend(device).buffer_from_pyval(a.value, device),)
+
+
+device_put_handlers[state.Ref] = ref_device_put_handler
+result_handlers[state.AbstractRef] = ref_result_handler
+num_buffers_handlers[state.AbstractRef] = lambda _: 1

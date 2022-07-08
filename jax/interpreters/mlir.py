@@ -41,6 +41,7 @@ from jax._src.lib.mlir.dialects import mhlo
 from jax._src.lib.mlir.dialects import func as func_dialect
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
+from jax._src import state
 from jax._src import source_info_util
 import jax._src.util as util
 from jax.config import config
@@ -158,6 +159,8 @@ ir_type_handlers[core.ShapedArray] = _array_ir_types
 ir_type_handlers[core.ConcreteArray] = _array_ir_types
 ir_type_handlers[core.AbstractToken] = lambda _: [mhlo.TokenType.get()]
 ir_type_handlers[core.DShapedArray] = _dynamic_array_ir_types
+ir_type_handlers[state.AbstractRef]  = _array_ir_types
+
 
 def aval_to_ir_type(aval: core.AbstractValue) -> ir.Type:
   """Convenience wrapper around aval_to_ir_types for single types.
@@ -551,9 +554,8 @@ def lower_jaxpr_to_module(
   Handles the quirks of the argument/return value passing conventions of the
   runtime.
   """
-  from jax._src.lax.control_flow import for_loop
-  if for_loop.State in jaxpr.effects:
-    jaxpr, consts = for_loop.discharge_state(jaxpr.jaxpr, jaxpr.consts)
+  if state.State in jaxpr.effects:
+    jaxpr, consts = state.discharge_state(jaxpr.jaxpr, jaxpr.consts)
     jaxpr = core.ClosedJaxpr(jaxpr, consts)
   platform = xb.canonicalize_platform(platform)
   if not xb.is_known_platform(platform):

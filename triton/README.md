@@ -29,6 +29,7 @@ $ pip install -e ".[cuda11_cudnn82]" -f https://storage.googleapis.com/jax-relea
 $ pip install pybind11
 $ cd triton
 $ make # compiles our custom call
+$ pip install .
 ```
 
 We have a couple examples already written. Try running (inside of `jax/triton/examples`):

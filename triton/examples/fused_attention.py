@@ -8,28 +8,34 @@ import jax.numpy as jnp
 from jax import random
 import numpy as np
 
+def _strides(shape):
+  all = np.prod(shape)
+  for s in shape:
+    all = all // s
+    yield int(all)
+
 @triton.jit
 def fused_attention_kernel(
     Q, K, V,
     TMP, L, M,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     Out,
+    stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qk: tl.constexpr,
+    stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kk: tl.constexpr, stride_kn: tl.constexpr,
+    stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vk: tl.constexpr, stride_vn: tl.constexpr,
+    stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_on: tl.constexpr,
+    Z: tl.constexpr, H: tl.constexpr, N_CTX: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    stride_qz, stride_qh, stride_qm, stride_qk = 196608, 65536, 64, 1
-    stride_kz, stride_kh, stride_kk, stride_kn = 196608, 65536, 1024, 1
-    stride_vz, stride_vh, stride_vk, stride_vn = 196608, 65536, 64, 1
-    stride_oz, stride_oh, stride_om, stride_on = 196608, 65536, 64, 1
-    Z, H, N_CTX = 2, 3, 1024
     start_qm = tl.program_id(0)
     off_hz = tl.program_id(1)
     # initialize offsets
     offs_m = start_qm * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    off_q = off_hz * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * 1
+    off_q = off_hz * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     off_k = off_hz * stride_qh + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
-    off_v = off_hz * stride_qh + offs_n[:, None] * stride_qm + offs_d[None, :] * 1
+    off_v = off_hz * stride_qh + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qk
     # Initialize pointers to Q, K, V
     q_ptrs = Q + off_q
     k_ptrs = K + off_k
@@ -68,9 +74,8 @@ def fused_attention_kernel(
         acc = acc * acc_scale[:, None]
         # update acc
         v = tl.load(v_ptrs)
-        oo = tl.dot(p, v)
-        acc += oo
-        k_ptrs += BLOCK_N * 1
+        acc += tl.dot(p, v)
+        k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vk
         # r_ptrs += BLOCK_N
         l_i = l_i_new
@@ -85,18 +90,10 @@ def fused_attention_kernel(
     tl.store(m_ptrs, m_i)
     # initialize pointers to output
     offs_n = tl.arange(0, BLOCK_DMODEL)
-    off_out = off_hz * stride_oh + offs_m[:, None] * stride_om + offs_n[None, :] * 1
+    off_out = off_hz * stride_oh + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
     out_ptrs = Out + off_out
     tl.store(out_ptrs, acc)
-
-
-def _strides(a):
-  all = np.prod(a.shape)
-  for s in a.shape:
-    all = all // s
-    yield all
-
-
+    
 def fused_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
   BLOCK = 128
   Lq, Lk = q.shape[-1], k.shape[-2]
@@ -107,9 +104,20 @@ def fused_attention(q: jnp.ndarray, k: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarr
       SimpleNamespace(shape=(q.shape[0] * q.shape[1], q.shape[2]), dtype=q.dtype),
       SimpleNamespace(shape=(q.shape[0] * q.shape[1], q.shape[2]), dtype=q.dtype),
       SimpleNamespace(shape=q.shape, dtype=q.dtype)]
+  stride_qz, stride_qh, stride_qm, stride_qk = _strides(q.shape)
+  stride_kz, stride_kh, stride_kk, stride_kn = _strides(k.shape)
+  stride_vz, stride_vh, stride_vk, stride_vn = _strides(v.shape)
+  stride_oz, stride_oh, stride_om, stride_on = _strides(out_shape[-1].shape)
+  
   metaparams = dict(
-    BLOCK_M=BLOCK, BLOCK_DMODEL=64,
+    BLOCK_M=BLOCK,
     BLOCK_N=BLOCK,
+    BLOCK_DMODEL=64,
+    stride_qz=stride_qz, stride_qh=stride_qh, stride_qm=stride_qm, stride_qk=stride_qk,
+    stride_kz=stride_kz, stride_kh=stride_kh, stride_kk=stride_kk, stride_kn=stride_kn,
+    stride_vz=stride_vz, stride_vh=stride_vh, stride_vk=stride_vk, stride_vn=stride_vn,
+    stride_oz=stride_oz, stride_oh=stride_oh, stride_om=stride_om, stride_on=stride_on,
+    Z=q.shape[0], H=q.shape[0], N_CTX=q.shape[0],
     num_warps=4, num_stages=1
   )
   _, _, _, output = jt.triton_call(q, k, v, kernel=fused_attention_kernel,

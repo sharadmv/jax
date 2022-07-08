@@ -31,7 +31,7 @@ $ cd triton
 $ make # compiles our custom call
 ```
 
-We have a couple examples already written. Try running (inside of `jax/triton`):
+We have a couple examples already written. Try running (inside of `jax/triton/examples`):
 ```bash
 $ python matrix_multiplication.py
 ```

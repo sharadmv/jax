@@ -57,7 +57,7 @@ void do_custom_call(CUstream stream, void** buffers,
   if (result != 0) {
     std::cout << "Failed launch: " << result << std::endl;
   }
-  cuStreamSynchronize(stream);
+  // cuStreamSynchronize(stream);
 }
 
 std::string MakeTritonCallDescriptor(uint64_t kernel_ptr, uint32_t shared_mem, uint32_t grid_0, uint32_t grid_1, uint32_t grid_2, uint32_t num_warps, uint32_t arity) {

@@ -48,6 +48,7 @@ from jax._src import device_array
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import source_info_util
+from jax._src import state
 from jax._src import traceback_util
 from jax._src.api_util import (
     flatten_fun, apply_flat_fun, flatten_fun_nokwargs, flatten_fun_nokwargs2,
@@ -3339,3 +3340,11 @@ def block_until_ready(x):
     except AttributeError:
       return x
   return jax.tree_util.tree_map(try_to_block, x)
+
+def make_ref(value: Any) -> state.Ref:
+  value = jax.numpy.array(value)
+  aval = core.raise_to_shaped(core.get_aval(value))
+  ref_aval = state.AbstractRef(aval.shape, aval.dtype, aval.weak_type)
+  return state.Ref(ref_aval, value)
+
+

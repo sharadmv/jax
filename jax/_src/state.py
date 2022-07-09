@@ -57,6 +57,16 @@ class AbstractRef(core.AbstractValue):
     assert self.dtype == other.dtype
     return self
 
+  @core.aval_method
+  @staticmethod
+  def get(tracer, idx=()):
+    return ref_get(tracer, idx)
+
+  @core.aval_method
+  @staticmethod
+  def set(tracer, value, idx=()):
+    return ref_set(tracer, idx, value)
+
   def _getitem(self, tracer, idx) -> Array:
     if not isinstance(idx, tuple):
       idx = idx,
@@ -78,14 +88,17 @@ core.raise_to_shaped_mappings[AbstractRef] = lambda aval, _: aval
 
 class Ref:
 
-  def __init__(self, value):
+  def __init__(self, aval, value):
     self.value = value
-    self.aval = AbstractRef(self.value.shape, self.value.dtype, False)
-    self.shape = self.value.shape
-    self.dtype = self.value.dtype
+    self.aval = aval
+    self.shape = aval.shape
+    self.dtype = aval.dtype
 
-  def get(self):
-    return ref_get(self, ())
+  def get(self, idx=()):
+    return ref_get(self, idx)
+
+  def set(self, value, idx=()):
+    return ref_set(self, idx, value)
 
   def __getitem__(self, idx):
     return ref_get(self, idx)
@@ -187,8 +200,8 @@ def ref_get(ref: Ref, idx: Tuple[int]) -> Array:
 swap_p = core.Primitive("swap")
 
 def _swap_impl(ref: Ref, value: Array, *idx: int):
-  del ref, idx, value
-  raise ValueError("Can't evaluate `swap` outside a stateful context.")
+  old_value, ref.value = ref.value, ref.value.at[idx].set(value)
+  return old_value
 swap_p.def_impl(_swap_impl)
 
 def ref_swap(ref: Ref, idx: Tuple[int], value: Array) -> Array:

@@ -544,6 +544,7 @@ def _input_handler(backend: Backend,
   if in_type is None:
     assert out_type is None
     return None
+  print(in_type, out_type)
   in_avals, which_explicit = util.unzip2(in_type)
   # Check whether we actually need an input_handler.
   needs_implicit = which_explicit and not all(which_explicit)
@@ -1115,8 +1116,10 @@ def _device_put_lowering(ctx, x, *, device):
 mlir.register_lowering(device_put_p, _device_put_lowering)
 
 def ref_result_handler(device, aval):
-  return lambda _, value: state.Ref(
-      device_array.make_device_array(aval, device, value))
+  def _handler(_, value):
+    value = device_array.make_device_array(aval, device, value)
+    return state.Ref(aval, device_array.make_device_array(aval, device, value))
+  return _handler
   
 def ref_device_put_handler(a, device):
   return (xb.get_device_backend(device).buffer_from_pyval(a.value, device),)

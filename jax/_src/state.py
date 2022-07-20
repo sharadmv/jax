@@ -16,15 +16,19 @@ from functools import partial
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from jax import api_util
 from jax import core
 from jax import linear_util as lu
+from jax import tree_util
 from jax._src import ad_util
 from jax._src import device_array
 from jax._src import dispatch
 from jax._src import pretty_printer as pp
 from jax._src.lib import xla_bridge, xla_client
-from jax._src.util import safe_map, safe_zip
+from jax._src.util import safe_map, safe_zip, split_list
 from jax.interpreters import ad
+from jax.interpreters import batching
+from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 import numpy as np
@@ -84,11 +88,21 @@ class AbstractRef(core.AbstractValue):
   def at_least_vspace(self):
     return self
 
+  def __eq__(self, other):
+    return (type(self) is type(other)
+            and self.dtype == other.dtype and self.shape == other.shape
+            and self.weak_type == other.weak_type)
+
+  def __hash__(self):
+    return hash((self.shape, self.dtype, self.weak_type))
+
+
 core.raise_to_shaped_mappings[AbstractRef] = lambda aval, _: aval
 
 class Ref:
 
   def __init__(self, aval, value):
+    assert not isinstance(value, Ref)
     self.value = value
     self.aval = aval
     self.shape = aval.shape
@@ -154,6 +168,9 @@ def ref_shape_handler(a):
 def to_shaped_array(shaped_array_ref):
   return core.ShapedArray(shaped_array_ref.shape, shaped_array_ref.dtype,
       shaped_array_ref.weak_type)
+def to_abstract_ref(shaped_array):
+  return AbstractRef(shaped_array.shape, shaped_array.dtype,
+                     shaped_array.weak_type)
 core.pytype_aval_mappings[Ref] = lambda x: x.aval
 xla.pytype_aval_mappings[Ref] = lambda x: x.aval
 xla.canonicalize_dtype_handlers[Ref] = lambda x: x
@@ -200,9 +217,25 @@ def ref_get(ref: Ref, idx: Tuple[int]) -> Array:
 swap_p = core.Primitive("swap")
 
 def _swap_impl(ref: Ref, value: Array, *idx: int):
-  old_value, ref.value = ref.value, ref.value.at[idx].set(value)
+  if not idx:
+    old_value, ref.value = ref.value, value
+  else:
+    old_value, ref.value = ref.value, ref.value.at[idx].set(value)
   return old_value
 swap_p.def_impl(_swap_impl)
+
+def _swap_batching_rule(args, dims):
+  ref, value, *idx = args
+  ref_dims, value_dims, *idx_dims = dims
+  import jax
+  out = jax.vmap(_swap_impl, in_axes=(ref_dims, value_dims, *idx_dims))(ref,
+      value, *idx)
+  return out, 0
+  print(ref, value, idx)
+  print(ref_dims, value_dims, idx_dims)
+  raise NotImplementedError
+  return old_value
+batching.primitive_batchers[swap_p] = _swap_batching_rule
 
 def ref_swap(ref: Ref, idx: Tuple[int], value: Array) -> Array:
   """Sets a `Ref`'s value and returns the original value."""
@@ -387,13 +420,10 @@ ad.primitive_transposes[swap_p] = _swap_transpose
 
 def discharge_state(jaxpr: core.Jaxpr, consts: Sequence[Any]) -> Tuple[core.Jaxpr, List[Any]]:
   """Converts a jaxpr that takes in `Ref`s into one that doesn't."""
-  is_const_ref = [isinstance(c, Ref) for c in consts]
-  consts = [c.value if ref else c for c, ref in zip(consts, is_const_ref)]
   in_avals = [core.ShapedArray(v.aval.shape, v.aval.dtype, v.aval.weak_type)
               if type(v.aval) is AbstractRef
               else v.aval for v in jaxpr.invars]
-  eval_jaxpr = lu.wrap_init(partial(_eval_jaxpr_discharge_state, jaxpr,
-    is_const_ref, consts))
+  eval_jaxpr = lu.wrap_init(partial(_eval_jaxpr_discharge_state, jaxpr, consts))
   new_jaxpr, _ , new_consts = pe.trace_to_jaxpr_dynamic(eval_jaxpr, in_avals)
   return new_jaxpr, new_consts
 
@@ -415,7 +445,7 @@ def _dynamic_update_index(x, idx, val):
   return lax.dynamic_update_slice(x, update, starts)
 
 def _eval_jaxpr_discharge_state(jaxpr: core.Jaxpr,
-                                is_const_ref, consts,
+                                consts,
                                 *args: Any):
   env: Dict[core.Var, Any] = {}
 
@@ -470,8 +500,59 @@ def _eval_jaxpr_discharge_state(jaxpr: core.Jaxpr,
   # values of the `Ref`s. Callers to this function should be able to split
   # them up by looking at `len(jaxpr.outvars)`.
   out_vals = map(read, jaxpr.outvars)
-  const_ref_vals = map(
-      read, [v for v in jaxpr.constvars if type(v.aval) is AbstractRef])
   ref_vals = map(
       read, [v for v in jaxpr.invars if type(v.aval) is AbstractRef])
-  return out_vals + const_ref_vals + ref_vals
+  return out_vals + ref_vals
+
+# # `run_state`
+
+run_state_p = core.Primitive("run_state")
+run_state_p.multiple_results = True
+
+def _run_state_impl(*args, jaxpr):
+  return _eval_jaxpr_discharge_state(jaxpr, (), *args)
+run_state_p.def_impl(_run_state_impl)
+
+def _run_state_abstract_eval(*avals, **_):
+  return avals
+run_state_p.def_abstract_eval(_run_state_abstract_eval)
+
+def _hoist_consts_to_refs(jaxpr: core.Jaxpr) -> tuple[core.Jaxpr, List[bool]]:
+  num_consts = len(jaxpr.constvars)
+  def _hoist(*consts_args):
+    const_refs, args = split_list(consts_args, [num_consts])
+    # We immediately read the const values out of the `Ref`s.
+    consts = [r.get() if not is_ref else r
+              for is_ref, r in zip(consts_is_ref, const_refs)]
+    return core.eval_jaxpr(jaxpr, consts, *args)
+  consts_is_ref = [type(var.aval) is AbstractRef for var in jaxpr.constvars]
+  const_avals = [AbstractRef(var.aval.shape, var.aval.dtype,
+    var.aval.weak_type) for var in  # pytype: disable=attribute-error
+                 jaxpr.constvars]
+  arg_avals = [var.aval for var in jaxpr.invars]
+  in_avals = [*const_avals, *arg_avals]
+  hoisted_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+      lu.wrap_init(_hoist), in_avals)
+  assert not consts, "All consts should have been converted to refs"
+  return hoisted_jaxpr, consts_is_ref
+
+def run_state(f):
+  def wrapped(*args):
+    fun = lu.wrap_init(f)
+    flat_args, in_tree = tree_util.tree_flatten(args)
+    flat_fun, _ = api_util.flatten_fun_nokwargs(fun, in_tree)
+    in_avals = [to_abstract_ref(core.raise_to_shaped(core.get_aval(val)))
+                for val in flat_args]
+    jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(flat_fun, in_avals)
+    jaxpr, consts_is_ref = _hoist_consts_to_refs(jaxpr)
+    const_vals = [c.get() if is_ref else c
+                  for c, is_ref in zip(consts, consts_is_ref)]
+    if out_avals:
+      raise ValueError("Input function to `run_state` cannot return anything.")
+    out_flat = run_state_p.bind(*const_vals, *flat_args, jaxpr=jaxpr)
+    out_consts, out_flat = split_list(out_flat, [len(consts)])
+    for is_ref, const, out_const in zip(consts_is_ref, consts, out_consts):
+      if is_ref:
+        const.set(out_const)
+    return tree_util.tree_unflatten(in_tree, out_flat)
+  return wrapped

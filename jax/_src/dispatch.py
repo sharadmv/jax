@@ -380,6 +380,10 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
     state.AbstractRef)]
   ref_avals = [v.aval for v in jaxpr.invars if isinstance(v.aval,
     state.AbstractRef)]
+  out_refs = [v.aval for v in jaxpr.outvars if isinstance(v.aval,
+    state.AbstractRef)]
+  ref_mapping = {i: jaxpr.invars.index(outvar) for i, outvar in
+                 enumerate(jaxpr.outvars) if outvar in jaxpr.invars}
   num_refs = len([v for v in jaxpr.invars if isinstance(v.aval,
     state.AbstractRef)])
   lowering_result = mlir.lower_jaxpr_to_module(
@@ -398,7 +402,7 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
       in_avals=abstract_args, out_avals=out_avals,
       has_unordered_effects=bool(unordered_effects),
       ordered_effects=ordered_effects, kept_var_idx=kept_var_idx,
-      num_refs=num_refs, const_refs=const_refs,
+      num_refs=num_refs, const_refs=const_refs, ref_mapping=ref_mapping,
       keepalive=keepalive, host_callbacks=host_callbacks)
 
 
@@ -544,7 +548,6 @@ def _input_handler(backend: Backend,
   if in_type is None:
     assert out_type is None
     return None
-  print(in_type, out_type)
   in_avals, which_explicit = util.unzip2(in_type)
   # Check whether we actually need an input_handler.
   needs_implicit = which_explicit and not all(which_explicit)
@@ -737,7 +740,7 @@ def _execute_compiled(name: str, compiled: XlaExecutable,
                       has_unordered_effects: bool,
                       ordered_effects: List[core.Effect],
                       const_refs: List[Any],
-                      kept_var_idx, *args):
+                      kept_var_idx, ref_mapping: Dict[int, int], *args):
   device, = compiled.local_devices()
   args, env = input_handler(args) if input_handler else (args, None)
   in_flat = flatten(device_put(x, device) for i, x in enumerate(args)
@@ -758,9 +761,14 @@ def _execute_compiled(name: str, compiled: XlaExecutable,
   else:
     ref_vals = []
   for ref, val in zip(refs, ref_vals):
-    ref.value = val
+    ref.value = val.value
   if refs:
     out = out[:-len(refs)]
+  out = list(out)
+  for out_index, in_index in ref_mapping.items():
+    in_ref = args[in_index]
+    in_ref.set(out[in_index].get())
+    out[in_index] = in_ref
   return out
 
 
@@ -949,6 +957,7 @@ class XlaCompiledComputation(stages.XlaExecutable):
                            kept_var_idx: Set[int],
                            num_refs: int, const_refs: List[Any],
                            keepalive: Optional[Any],
+                           ref_mapping: Dict[int, int],
                            host_callbacks: List[Any]) -> XlaCompiledComputation:
     sticky_device = device
     input_handler = _input_handler(backend, in_type, out_type)
@@ -972,7 +981,7 @@ class XlaCompiledComputation(stages.XlaExecutable):
     execute = _execute_compiled if nreps == 1 else _execute_replicated
     unsafe_call = partial(execute, name, compiled, input_handler, buffer_counts,  # type: ignore  # noqa: F811
                           result_handler, has_unordered_effects,
-                          ordered_effects, const_refs, kept_var_idx)
+                          ordered_effects, const_refs, kept_var_idx, ref_mapping)
     return XlaCompiledComputation(compiled, in_avals, kept_var_idx, unsafe_call,
                                   keepalive)
 
@@ -1118,7 +1127,7 @@ mlir.register_lowering(device_put_p, _device_put_lowering)
 def ref_result_handler(device, aval):
   def _handler(_, value):
     value = device_array.make_device_array(aval, device, value)
-    return state.Ref(aval, device_array.make_device_array(aval, device, value))
+    return state.Ref(aval, value)
   return _handler
   
 def ref_device_put_handler(a, device):

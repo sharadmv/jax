@@ -1819,8 +1819,8 @@ class DynamicJaxprTrace(core.Trace):
     # TODO(mattjj): check in_tracers are consistent with f.in_type annotation
     with core.new_sublevel():
       jaxpr, out_type, consts = trace_to_subjaxpr_dynamic2(f, self.main)
-    if jaxpr.effects:
-      raise NotImplementedError('Effects not supported for call primitives.')
+    # if jaxpr.effects:
+    #   raise NotImplementedError('Effects not supported for call primitives.')
     if params.get('inline', False):
       return core.eval_jaxpr(jaxpr, consts, *in_tracers)
     source_info = source_info_util.current()

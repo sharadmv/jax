@@ -77,6 +77,71 @@ class RefCompatibilityTest(jtu.JaxTestCase):
     self.assertEqual(f(ref), 2.)
     self.assertEqual(ref.get(), 2.)
 
+  def test_can_get_multiple_references_to_same_value(self):
+    @jax.jit
+    def f(ref):
+      x = ref.get()
+      ref.set(x * 2.)
+      return ref
+    ref = api.make_ref(jnp.array(1.))
+    ref2 = f(ref)
+    self.assertEqual(ref2.get(), 2.)
+    self.assertEqual(ref.get(), 2.)
+    ref2.set(1.)
+    self.assertEqual(ref2.get(), 1.)
+    self.assertEqual(ref.get(), 1.)
+
+  def test_state_with_vmap(self):
+    ref = api.make_ref(jnp.ones(4))
+
+    @jax.vmap
+    def foo(x):
+      ref.set(x)
+    out = foo(jnp.arange(4.))
+    print("OUT", ref.get())
+    assert False
+
+  # def test_can_create_ref_in_jitted_function(self):
+  #   @jax.jit
+  #   def f(x):
+  #     ref = api.make_ref(x)
+  #     return ref.get()
+  #   print(jax.make_jaxpr(f)(jnp.int32(2)))
+  #   ref = f(2.)
+  #   self.assertEqual(ref.get(), 2.)
+  #   ref.set(1.)
+  #   self.assertEqual(ref.get(), 1.)
+
+class RunStateTest(jtu.JaxTestCase):
+
+  def test_run_state_simple(self):
+
+    def f(ref):
+      ref.set(2.)
+
+    out = state.run_state(f)(1.)
+    self.assertTupleEqual(out, (2.,))
+
+  def test_run_state_simple_closed_over_ref(self):
+
+    outer_ref = api.make_ref(3.)
+    def f(ref):
+      ref.set(2.)
+      outer_ref.set(4.)
+
+    out = state.run_state(f)(1.)
+    self.assertTupleEqual(out, (2.,))
+    self.assertEqual(outer_ref.get(), 4.)
+
+  def test_run_state_simple_closed_over_ref_in_jit(self):
+
+    def f(outer_ref):
+      def g(ref):
+        ref.set(2.)
+        outer_ref.set(4.)
+      state.run_state(g)(3.)
+    out = jax.jit(state.run_state(f))(1.)
+    self.assertTupleEqual(out, (4.,))
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

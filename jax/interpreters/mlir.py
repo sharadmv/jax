@@ -1487,6 +1487,14 @@ def emit_python_callback(
     token, *results = results
   return results, token, keepalive
 
+
+register_lowering(state.run_state_p, lower_fun(state._run_state_impl, multiple_results=True))
+
+def _ref_constant_handler(val, canonicalize_types):
+  return _ndarray_constant_handler(val.value.device_buffer.to_py(),
+                                   canonicalize_types)
+register_constant_handler(state.Ref, _ref_constant_handler)
+
 # Lax ops missing MLIR lowerings.
 # # TODO(b/203775215): these are missing from the cHLO dialect. Either add
 # # them or port them to Python.

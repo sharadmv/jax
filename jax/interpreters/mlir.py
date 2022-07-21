@@ -1363,6 +1363,12 @@ def send_to_host(channel: int, token: mhlo.TokenType, operand: Any,
           _xla_host_transfer_handler_name=ir.StringAttr.get(str(name)),
           _xla_host_transfer_original_type=ir.StringAttr.get(dtype_str),
           _xla_host_transfer_rendezvous=ir.StringAttr.get(str(name))))
+  array_sharding_proto = xc.OpSharding()
+  array_sharding_proto.type = xc.OpSharding.Type.MAXIMAL
+  array_sharding_proto.tile_assignment_dimensions = [1]
+  array_sharding_proto.tile_assignment_devices = [0]
+  # result = wrap_with_sharding_op(send_op.result, array_sharding_proto)
+  set_sharding(send_op, array_sharding_proto)
   return send_op.result
 
 
@@ -1399,11 +1405,12 @@ def emit_python_callback(
     raise ValueError(
         f"`EmitPythonCallback` not supported on {platform} backend.")
   backend = xb.get_backend(platform)
+  # result_avals = [core.ShapedArray((), np.float32), *result_avals]
   result_shapes = util.flatten(
       [xla.aval_to_xla_shapes(result_aval) for result_aval in result_avals])
   operand_shapes = util.flatten(
       [xla.aval_to_xla_shapes(op_aval) for op_aval in operand_avals])
-  if platform == "tpu":
+  if platform == "cpu":
     if result_avals:
       raise NotImplementedError(
           "Callback with return values not supported on TPU.")
@@ -1463,6 +1470,11 @@ def emit_python_callback(
   result_type = ir.TupleType.get_tuple(result_types)
   call_target_name = ("xla_python_gpu_callback"
                      if platform in {"cuda", "rocm"} else "xla_python_cpu_callback")
+  array_sharding_proto = xc.OpSharding()
+  array_sharding_proto.type = xc.OpSharding.Type.MAXIMAL
+  array_sharding_proto.tile_assignment_dimensions = [1]
+  array_sharding_proto.tile_assignment_devices = [0]
+  callback_operands = [wrap_with_sharding_op(op, array_sharding_proto) for op in callback_operands]
   result = mhlo.CustomCallOp(
       [result_type],
       callback_operands,
@@ -1473,6 +1485,11 @@ def emit_python_callback(
       backend_config=ir.StringAttr.get(str(callback_descriptor)),
       operand_layouts=None,
       result_layouts=None)
+  array_sharding_proto = xc.OpSharding()
+  array_sharding_proto.type = xc.OpSharding.Type.MAXIMAL
+  array_sharding_proto.tile_assignment_dimensions = [1]
+  array_sharding_proto.tile_assignment_devices = [0]
+  set_sharding(result, array_sharding_proto)
   results = [
       mhlo.GetTupleElementOp(result, i32_attr(i)).result
       for i in range(len(result_types))

@@ -29,6 +29,8 @@ from jax.interpreters import mlir
 from jax._src.lax import control_flow as lcf
 import jax.numpy as jnp
 
+from jax._src.lib import xla_client as xc
+
 DebugEffect = enum.Enum('DebugEffect', ['PRINT', 'ORDERED_PRINT'])
 
 core.ordered_effects.add(DebugEffect.ORDERED_PRINT)

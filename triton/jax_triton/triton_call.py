@@ -70,7 +70,6 @@ def compile(triton_function, constants, *, key, device=0, num_warps=4, num_stage
             attributes=attributes, constants=constants, num_warps=num_warps,
             num_stages=num_stages, key=key, is_manual_warmup=True,
             extern_libs={})
-        pass
     return lower
 
 def j2t(x_jax):

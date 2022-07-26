@@ -66,7 +66,10 @@ def compile(triton_function, constants, *, key, device=0, num_warps=4, num_stage
     def lower(*args):
         arg_types = [get_triton_python_ir(a) for a in args]
         attributes = {i: 16 for i in range(len(args))}
-        triton_function._warmup(arg_types=arg_types, device=device, attributes=attributes, constants=constants, num_warps=num_warps, num_stages=num_stages, key=key, is_manual_warmup=True)
+        triton_function._warmup(arg_types=arg_types, device=device,
+            attributes=attributes, constants=constants, num_warps=num_warps,
+            num_stages=num_stages, key=key, is_manual_warmup=True,
+            extern_libs={})
         pass
     return lower
 

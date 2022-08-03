@@ -879,6 +879,13 @@ def xla_pmap_impl(fun: lu.WrappedFun, *args,
                   out_axes_thunk: Callable[[], Sequence[Optional[int]]],
                   donated_invars: Sequence[bool],
                   global_arg_shapes: Sequence[Optional[Tuple[int, ...]]]):
+  if config.jax_disable_jit:
+    return _emap_impl(fun, *args, backend=backend, axis_name=axis_name,
+                      axis_size=axis_size, global_axis_size=global_axis_size,
+                      devices=devices, name=name, in_axes=in_axes,
+                      out_axes_thunk=out_axes_thunk,
+                      donated_invars=donated_invars,
+                      global_arg_shapes=global_arg_shapes)
   abstract_args = unsafe_map(xla.abstractify, args)
   compiled_fun, fingerprint = parallel_callable(
       fun, backend, axis_name, axis_size, global_axis_size, devices, name,
@@ -894,6 +901,25 @@ def xla_pmap_impl(fun: lu.WrappedFun, *args,
                           ("fingerprint", fingerprint))
   return compiled_fun(*args)
 
+def _emap_impl(fun: lu.WrappedFun, *args,
+               backend: Optional[str],
+               axis_name: core.AxisName,
+               axis_size: int,
+               global_axis_size: Optional[int],
+               devices: Optional[Sequence[Any]],
+               name: str,
+               in_axes: Sequence[Optional[int]],
+               out_axes_thunk: Callable[[], Sequence[Optional[int]]],
+               donated_invars: Sequence[bool],
+               global_arg_shapes: Sequence[Optional[Tuple[int, ...]]]):
+  if global_axis_size is not None: raise NotImplementedError
+  # TODO in_axes
+  del global_axis_size, global_arg_shapes
+  devices = jax.devices()[:axis_size]
+  with core.new_base_main(MapTrace) as main:
+    with core.new_sublevel():
+      t = main.with_cur_sublevel()
+      sharded_args = [MapTracer(t, jax.device_put_sharded(list(x), devices))
 
 @lu.cache
 def parallel_callable(fun: lu.WrappedFun,

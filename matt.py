@@ -53,19 +53,21 @@ def g(x):
   with jax._src.config.disable_jit(False):
     return jax.jit(jnp.sin)(x)
 
+print(g(jnp.arange(4.)))
+
 with jax.disable_jit():
   print(g(jnp.arange(4.)))
 
 
-@functools.partial(jax.pmap, axis_name='i')
+@functools.partial(jax.pmap, axis_name='i', in_axes=1, out_axes=1)
 def f(x):
-  return x / jax.lax.psum(x, 'i')
+  return jnp.cos(x / jax.lax.psum(x, 'i'))
 
-x = jnp.arange(4.)
+x = jnp.arange(8.).reshape((4, 2))
 print(f(x))
 
 with jax.disable_jit():
-  x = jnp.arange(4.)
+  x = jnp.arange(8.).reshape((4, 2))
   print(f(x))
 
 

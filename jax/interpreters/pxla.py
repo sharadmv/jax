@@ -916,22 +916,45 @@ def _emap_impl(fun: lu.WrappedFun, *args,
                donated_invars: Sequence[bool],
                global_arg_shapes: Sequence[Optional[Tuple[int, ...]]]):
   if global_axis_size is not None: raise NotImplementedError
-  # TODO if in_axes
-  if any(axis != 0 for axis in in_axes):
-    raise NotImplementedError()
   del global_axis_size, global_arg_shapes
   devices = xb.devices(backend=backend)[:axis_size]
-  sharded_args = [jax.device_put_sharded(list(x), devices) for x in args]
+  sharded_args = []
+  shard_axes = []
+  for arg, in_axis in zip(args, in_axes):
+    if in_axis == 0:
+      sharded_args.append(jax.device_put_sharded(list(arg), devices))
+      shard_axes.append({axis_name: 0})
+    elif in_axis is None:
+      sharded_args.append(arg)
+      shard_axes.append({})
+    else:
+      perm = list(range(arg.ndim))
+      a = perm.pop(in_axis)
+      perm.insert(0, a)
+      new_arg = arg.transpose(perm)
+      sharded_args.append(jax.device_put_sharded(list(new_arg), devices))
+      shard_axes.append({axis_name: 0})
   with core.new_base_main(MapTrace) as main:
     with core.new_sublevel(), core.extend_axis_env(axis_name, axis_size, main):
       t = main.with_cur_sublevel()
-      shard_axes = {axis_name: 0}
-      tracers = [MapTracer(t, arg, shard_axes) for arg in sharded_args]
+      tracers = [
+          MapTracer(t, arg, s) for arg, s in zip(sharded_args, shard_axes)]
       ans = fun.call_wrapped(*tracers)
       out_tracers = map(t.full_raise, ans)
       outvals = [t.val for t in out_tracers]
     del main
-  return outvals
+  out_axes = out_axes_thunk()
+  new_outvals = []
+  for out_axis, outval in zip(out_axes, outvals):
+    if out_axis is None:
+      new_outvals.append(outval[0])
+    elif out_axis == 0:
+      new_outvals.append(outval)
+    else:
+      with jax._src.config.disable_jit(False):
+        new_outvals.append(
+            jax.pmap(lambda x: x, in_axes=0, out_axes=out_axis)(outval))
+  return new_outvals
 
 class MapTrace(core.Trace):
 
@@ -951,7 +974,7 @@ class MapTrace(core.Trace):
     for name in names:
       in_axes = tuple(t.shard_axes.get(name, None) for t in tracers)
       if any(axis is not None for axis in in_axes):
-        f = jax.pmap(f, in_axes=in_axes)
+        f = jax.pmap(f, in_axes=in_axes, axis_name=name)
       else:
         skipped_axes.add(name)
     with core.eval_context(), jax._src.config.disable_jit(False):
@@ -988,7 +1011,6 @@ class MapTracer(core.Tracer):
 
   def __str__(self):
     named_axes = [f"{k}={v}" for k, v in self.shard_axes.items()]
-    print(named_axes)
     return f"{self.val}{{{','.join(named_axes)}}}"
 
 @lu.cache

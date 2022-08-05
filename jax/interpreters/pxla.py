@@ -913,13 +913,81 @@ def _emap_impl(fun: lu.WrappedFun, *args,
                donated_invars: Sequence[bool],
                global_arg_shapes: Sequence[Optional[Tuple[int, ...]]]):
   if global_axis_size is not None: raise NotImplementedError
-  # TODO in_axes
+  # TODO if in_axes
+  if any(axis != 0 for axis in in_axes):
+    raise NotImplementedError()
   del global_axis_size, global_arg_shapes
-  devices = jax.devices()[:axis_size]
+  devices = xb.devices(backend=backend)[:axis_size]
+  sharded_args = [jax.device_put_sharded(list(x), devices) for x in args]
   with core.new_base_main(MapTrace) as main:
-    with core.new_sublevel():
+    with core.new_sublevel(), core.extend_axis_env(axis_name, axis_size, main):
       t = main.with_cur_sublevel()
-      sharded_args = [MapTracer(t, jax.device_put_sharded(list(x), devices))
+      shard_axes = {axis_name: 0}
+      tracers = [MapTracer(t, arg, shard_axes) for arg in sharded_args]
+      ans = fun.call_wrapped(*tracers)
+      out_tracers = map(t.full_raise, ans)
+      outvals = [t.val for t in out_tracers]
+    del main
+  return outvals
+
+class MapTrace(core.Trace):
+
+  def _get_frames(self):
+    frames = [f for f in core.thread_local_state.trace_state.axis_env
+              if f.main_trace is self.main]
+    return frames
+
+  def pure(self, val):
+    return MapTracer(self, val, {})
+
+  def process_primitive(self, primitive, tracers, params):
+    vals = [t.val for t in tracers]
+    names = [f.name for f in self._get_frames()]
+    f = lambda *args: primitive.bind(*args, **params)
+    skipped_axes = set()
+    for name in names:
+      in_axes = tuple(t.shard_axes.get(name, None) for t in tracers)
+      if all(axis is None for axis in in_axes):
+        skipped_axes.add(name)
+        continue
+      f = jax.pmap(f, in_axes=in_axes)
+    with core.eval_context(), jax._src.config.disable_jit(False):
+      outvals = f(*vals)
+    out_shard_axes = {name: i for i, name in enumerate(reversed(names))
+                      if name not in skipped_axes}
+    if primitive.multiple_results:
+      return [MapTracer(self, val, out_shard_axes) for val in outvals]
+    return MapTracer(self, outvals, out_shard_axes)
+
+  def process_call(self, call_primitive, f, tracers, params):
+    raise NotImplementedError
+      
+  def process_map(self, map_primitive, f, tracers, params):
+    raise NotImplementedError
+      
+
+class MapTracer(core.Tracer):
+  __slots__ = ["val", "shard_axes"]
+  
+  def __init__(self, trace: MapTrace, val, shard_axes: Dict[core.AxisName, int]):
+    self._trace = trace
+    self.val = val
+    self.shard_axes = shard_axes
+
+  @property
+  def aval(self):
+    aval = xla.abstractify(self.val)
+    for axis_idx in self.shard_axes.values():
+      aval = core.mapped_aval(aval.shape[axis_idx], axis_idx, aval)
+    return aval
+
+  def full_lower(self):
+    return self
+
+  def __str__(self):
+    named_axes = [f"{k}={v}" for k, v in self.shard_axes.items()]
+    print(named_axes)
+    return f"{self.val}{{{','.join(named_axes)}}}"
 
 @lu.cache
 def parallel_callable(fun: lu.WrappedFun,

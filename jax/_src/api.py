@@ -111,7 +111,7 @@ zip, unsafe_zip = safe_zip, zip
 FLAGS = flags.FLAGS
 
 flags.DEFINE_bool(
-    "experimental_cpp_jit", bool_env("JAX_CPP_JIT", True),
+    "experimental_cpp_jit", bool_env("JAX_CPP_JIT", False),
     "A flag enabling the C++ jax.jit fast path."
     "Set this to `False` only if it crashes otherwise and report "
     "the error to the jax-team.")

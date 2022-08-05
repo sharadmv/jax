@@ -37,13 +37,15 @@ import dataclasses
 from functools import partial, lru_cache
 import itertools as it
 import operator as op
+import sys
 import threading
+import types
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional, FrozenSet,
                     Sequence, Set, Tuple, Type, Union, Iterable, Mapping, cast,
                     TYPE_CHECKING)
-import sys
 
 from absl import logging
+
 import numpy as np
 
 import jax
@@ -76,7 +78,8 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
 from jax._src.util import (unzip3, prod, safe_map, safe_zip, partition_list,
                            new_name_stack, wrap_name, assert_unreachable,
-                           tuple_insert, tuple_delete, distributed_debug_log)
+                           tuple_insert, tuple_delete, distributed_debug_log,
+                           split_dict)
 
 if TYPE_CHECKING:
   from jax.experimental.sharding import MeshPspecSharding, XLACompatibleSharding
@@ -947,10 +950,10 @@ class MapTrace(core.Trace):
     skipped_axes = set()
     for name in names:
       in_axes = tuple(t.shard_axes.get(name, None) for t in tracers)
-      if all(axis is None for axis in in_axes):
+      if any(axis is not None for axis in in_axes):
+        f = jax.pmap(f, in_axes=in_axes)
+      else:
         skipped_axes.add(name)
-        continue
-      f = jax.pmap(f, in_axes=in_axes)
     with core.eval_context(), jax._src.config.disable_jit(False):
       outvals = f(*vals)
     out_shard_axes = {name: i for i, name in enumerate(reversed(names))
@@ -959,16 +962,15 @@ class MapTrace(core.Trace):
       return [MapTracer(self, val, out_shard_axes) for val in outvals]
     return MapTracer(self, outvals, out_shard_axes)
 
-  def process_call(self, call_primitive, f, tracers, params):
-    raise NotImplementedError
-      
-  def process_map(self, map_primitive, f, tracers, params):
-    raise NotImplementedError
-      
+  def process_call(self, call_primitive, fun, tracers, params):
+    if call_primitive is not xla.xla_call_p: raise NotImplementedError
+    fake_primitive = types.SimpleNamespace(
+        multiple_results=True, bind=partial(call_primitive.bind, fun))
+    return self.process_primitive(fake_primitive, tracers, params)
 
 class MapTracer(core.Tracer):
   __slots__ = ["val", "shard_axes"]
-  
+
   def __init__(self, trace: MapTrace, val, shard_axes: Dict[core.AxisName, int]):
     self._trace = trace
     self.val = val

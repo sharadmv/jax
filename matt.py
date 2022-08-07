@@ -70,6 +70,17 @@ with jax.disable_jit():
   x = jnp.arange(8.).reshape((4, 2))
   print(f(x))
 
+@functools.partial(jax.pmap, axis_name='i', in_axes=0, out_axes=0)
+def f(x):
+  return jax._src.lax.parallel.pargmax(x, 'i')
+
+x = jnp.arange(8.).reshape((4, 2))
+print(f(x))
+
+with jax.disable_jit():
+  x = jnp.arange(8.).reshape((4, 2))
+  print(f(x))
+
 
 # TODO:
 # * [x] process_call

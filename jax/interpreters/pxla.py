@@ -63,6 +63,7 @@ from jax.tree_util import tree_flatten, tree_map
 from jax._src import abstract_arrays
 from jax._src import api_util
 from jax._src import device_array
+from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import util
 from jax._src import dispatch
@@ -917,7 +918,14 @@ def _emap_impl(fun: lu.WrappedFun, *args,
                global_arg_shapes: Sequence[Optional[Tuple[int, ...]]]):
   if global_axis_size is not None: raise NotImplementedError
   del global_axis_size, global_arg_shapes
-  devices = xb.devices(backend=backend)[:axis_size]
+  if devices is not None:
+    if len(devices) != axis_size:
+      raise ValueError(
+          f"Leading axis size of input to pmapped function must equal the "
+          f"number of local devices passed to pmap. Got axis_size="
+          f"{axis_size}, num_local_devices={len(devices)}.")
+  else:
+    devices = xb.devices(backend=backend)[:axis_size]
   sharded_args = []
   shard_axes = []
   for arg, in_axis in zip(args, in_axes):
@@ -942,18 +950,31 @@ def _emap_impl(fun: lu.WrappedFun, *args,
       ans = fun.call_wrapped(*tracers)
       out_tracers = map(t.full_raise, ans)
       outvals = [t.val for t in out_tracers]
+      out_shard_axes = [t.shard_axes for t in tracers]
     del main
   out_axes = out_axes_thunk()
   new_outvals = []
-  for out_axis, outval in zip(out_axes, outvals):
+  for out_axis, outval, shard_axes in zip(out_axes, outvals, out_shard_axes):
     if out_axis is None:
-      new_outvals.append(outval[0])
+      if shard_axes != {}:
+        new_outvals.append(outval[0])
+      else:
+        new_outvals.append(outval)
     elif out_axis == 0:
+      if shard_axes == {}:
+        outval = jax.device_put_replicated(outval, devices)
       new_outvals.append(outval)
     else:
       with jax._src.config.disable_jit(False):
-        new_outvals.append(
-            jax.pmap(lambda x: x, in_axes=0, out_axes=out_axis)(outval))
+        if shard_axes == {}:
+          outval = jax.device_put_replicated(outval, devices)
+          new_outvals.append(
+              jax.pmap(lambda x: x, in_axes=0,
+                       out_axes=out_axis)(outval))
+        else:
+          new_outvals.append(
+              jax.pmap(lambda x: x, in_axes=shard_axes[axis_name],
+                       out_axes=out_axis)(outval))
   return new_outvals
 
 class MapTrace(core.Trace):
@@ -990,6 +1011,13 @@ class MapTrace(core.Trace):
     fake_primitive = types.SimpleNamespace(
         multiple_results=True, bind=partial(call_primitive.bind, fun))
     return self.process_primitive(fake_primitive, tracers, params)
+
+  def process_axis_index(self, frame):
+    assert frame.size is not None
+    from jax import lax
+    with core.eval_context():
+      range = lax.iota(np.int32, frame.size)
+    return MapTracer(self, range, {frame.name: 0})
 
 class MapTracer(core.Tracer):
   __slots__ = ["val", "shard_axes"]

@@ -18,7 +18,6 @@ import operator
 from typing import Any, Callable, Generic, List, Optional, Sequence, Tuple, TypeVar
 
 from jax import core
-from jax import lax
 from jax import linear_util as lu
 from jax.api_util import flatten_fun_nokwargs
 from jax.interpreters import ad
@@ -32,6 +31,9 @@ from jax._src import ad_util
 from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import state
+from jax._src.lax import lax
+from jax._src.lax import slicing
+from jax._src.lax import control_flow
 from jax._src.util import (partition_list, merge_lists, safe_map, safe_zip,
                            split_list)
 import jax.numpy as jnp
@@ -128,8 +130,8 @@ def for_loop(nsteps: int, body: Callable[[Array, Ref[S]], None], init_state: S,
     nsteps: Number of iterations
     body: A callable that takes in the iteration number as its first argument
       and `Ref`s corresponding to `init_state` as its second argument.
-      `body` is free to read from and write to its `Ref`s. `body` should
-       not return anything.
+      `body` is free to read from and write to its `Ref`s. The return values
+      from `body` will be accumulated and returned.
     init_state: A Pytree of JAX-compatible values used to initialize the `Ref`s
       that will be passed into the for loop body.
   Returns:
@@ -140,8 +142,7 @@ def for_loop(nsteps: int, body: Callable[[Array, Ref[S]], None], init_state: S,
   idx_aval = core.ShapedArray((), jnp.dtype("int32"))
   jaxpr, consts, out_tree = _trace_to_jaxpr_with_refs(
       body, state_tree, [idx_aval, *state_avals])
-  if out_tree != tree_structure(None):
-    raise Exception("`body` should not return anything.")
+  num_consts, num_state = len(consts), len(flat_state)
   # Remove constvars from jaxpr and turn them into `Ref`s
   jaxpr = _hoist_consts_to_refs(jaxpr)
   which_linear = (False,) * (len(consts) + len(flat_state))
@@ -149,8 +150,9 @@ def for_loop(nsteps: int, body: Callable[[Array, Ref[S]], None], init_state: S,
                         reverse=reverse, which_linear=which_linear)
   # Consts are `Ref`s so they are both inputs and outputs. We remove them from
   # the outputs.
-  out_flat = out_flat[len(consts):]
-  return tree_unflatten(state_tree, out_flat)
+  _, out_state, out_flat = split_list(out_flat, [num_consts, num_state])
+  return (
+      tree_unflatten(state_tree, out_state), tree_unflatten(out_tree, out_flat))
 
 Carry = TypeVar('Carry')
 X = TypeVar('X')
@@ -222,24 +224,40 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
 
 
 @for_p.def_abstract_eval
-def _for_abstract_eval(*avals, jaxpr, **__):
-  return list(avals)
+def _for_abstract_eval(*avals, jaxpr, nsteps, **__):
+  ys_avals = [core.unmapped_aval(nsteps, core.no_axis_name, 0, v.aval) for v
+              in jaxpr.outvars]
+  return [*avals, *ys_avals]
+
+def _empty_array(sz, aval):
+  aval = core.unmapped_aval(sz, core.no_axis_name, 0, aval)
+  return lax.zeros_like_shaped_array(aval)
+  return lax.broadcast(lax.empty(aval.dtype), (sz, *aval.shape))
+
+def _update_array(i, aval, xs, x):
+  return slicing.dynamic_update_index_in_dim(xs, x, i, 0)
 
 def _for_impl(*args, jaxpr, nsteps, reverse, which_linear):
   del which_linear
   discharged_jaxpr, consts = discharge_state(jaxpr, ())
+  y_avals = [var.aval for var in jaxpr.outvars]
+  ys = map(partial(_empty_array, nsteps), y_avals)
   def cond(carry):
-    i, _ = carry
+    i, _, _ = carry
     return i < nsteps
   def body(carry):
-    i, state = carry
+    i, state, ys = carry
     i_ = nsteps - i - 1 if reverse else i
-    next_state = core.eval_jaxpr(discharged_jaxpr, consts, i_, *state)
-    return i + 1, next_state
-  _, state = lax.while_loop(cond, body, (jnp.int32(0), list(args)))
-  return state
+    out_flat = core.eval_jaxpr(discharged_jaxpr, consts, i_, *state)
+    y_updates, next_state = split_list(out_flat, [len(jaxpr.outvars)])
+    ys_out = map(partial(_update_array, i_), y_avals, ys, y_updates)
+    return i + 1, next_state, ys_out
+  _, state, ys = control_flow.while_loop(cond, body, 
+                                         (jnp.int32(0), list(args), ys))
+  return [*state, *ys]
 mlir.register_lowering(for_p, mlir.lower_fun(_for_impl, multiple_results=True))
-for_p.def_impl(partial(xla.apply_primitive, for_p))
+for_p.def_impl(_for_impl)
+# for_p.def_impl(partial(xla.apply_primitive, for_p))
 
 def _for_vmap(axis_size, axis_name, main_type, args, dims, *,
               jaxpr, nsteps, reverse, which_linear):

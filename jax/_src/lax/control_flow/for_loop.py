@@ -104,8 +104,8 @@ def val_to_ref_aval(x) -> ShapedArrayRef:
     raise Exception(f"can't make ref from {x}")
   return ShapedArrayRef(aval.shape, aval.dtype)
 
-def for_loop(nsteps: int, body: Callable[[Array, Ref[S]], None], init_state: S,
-             *, reverse: bool = False) -> S:
+def for_loop(nsteps: int, body: Callable[[Array, Ref[S]], Any], init_state: S,
+             *, reverse: bool = False) -> Tuple[S, Any]:
   """A for-loop combinator that allows read/write semantics in the loop body.
 
   `for_loop` is a higher-order function that enables writing loops that can be
@@ -219,7 +219,7 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
     tree_map(lambda c_ref, c: ref_set(c_ref, (), c), carry_refs, carry)
     tree_map(lambda y_ref, y: ref_set(y_ref, (i,), y), ys_refs, y)
   assert isinstance(length, int)
-  init, _, ys = for_loop(length, for_body, (init, xs, ys), reverse=reverse)
+  (init, _, ys), _ = for_loop(length, for_body, (init, xs, ys), reverse=reverse)
   return init, ys
 
 
@@ -252,12 +252,11 @@ def _for_impl(*args, jaxpr, nsteps, reverse, which_linear):
     y_updates, next_state = split_list(out_flat, [len(jaxpr.outvars)])
     ys_out = map(partial(_update_array, i_), y_avals, ys, y_updates)
     return i + 1, next_state, ys_out
-  _, state, ys = control_flow.while_loop(cond, body, 
+  _, state, ys = control_flow.while_loop(cond, body,
                                          (jnp.int32(0), list(args), ys))
   return [*state, *ys]
 mlir.register_lowering(for_p, mlir.lower_fun(_for_impl, multiple_results=True))
-for_p.def_impl(_for_impl)
-# for_p.def_impl(partial(xla.apply_primitive, for_p))
+for_p.def_impl(partial(xla.apply_primitive, for_p))
 
 def _for_vmap(axis_size, axis_name, main_type, args, dims, *,
               jaxpr, nsteps, reverse, which_linear):
@@ -597,12 +596,12 @@ def discharged_for_loop(nsteps, body, init_state, *, reverse: bool = False):
     raise Exception("`body` should not return anything.")
   discharged_jaxpr, discharged_consts = discharge_state(jaxpr, consts)
 
-  def fori_body(i, carry):
-    i = jnp.int32(i)
-    if reverse:
-      i = nsteps - i - 1
+  def scan_body(in_state, i):
     out_flat = core.eval_jaxpr(discharged_jaxpr, discharged_consts,
-                               i, *carry)
-    return out_flat
-  out_flat = loops.fori_loop(0, nsteps, fori_body, flat_state)
-  return tree_unflatten(state_tree, out_flat)
+                               i, *in_state)
+    out_flat, out_state = split_list(out_flat, [len(jaxpr.outvars)])
+    return out_state, out_flat
+  idx = jnp.arange(nsteps, dtype=jnp.dtype("int32"))
+  out_state, out_flat = loops.scan(scan_body, flat_state, idx, reverse=reverse)
+  return (
+      tree_unflatten(state_tree, out_state), tree_unflatten(out_tree, out_flat))

@@ -12,27 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module for state types."""
-from functools import partial
+from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any
 
-from jax import api_util
 from jax import core
-from jax import linear_util as lu
-from jax import tree_util
-from jax._src import ad_util
-from jax._src import device_array
-from jax._src import dispatch
 from jax._src import pretty_printer as pp
 from jax._src.lib import xla_bridge, xla_client
-from jax._src.util import (safe_map, safe_zip, split_list, tuple_insert,
-                           tuple_delete, prod)
-from jax.interpreters import ad
-from jax.interpreters import batching
-from jax.interpreters import mlir
-from jax.interpreters import partial_eval as pe
-from jax.interpreters import xla
-import numpy as np
+from jax._src.util import (safe_map, safe_zip, tuple_insert, tuple_delete, prod)
 
 xc = xla_client
 xb = xla_bridge
@@ -44,11 +31,33 @@ zip, unsafe_zip = safe_zip, zip
 
 Array = Any
 
-class _StateEffect:
+class StateEffect:
+  ref_aval: ShapedArrayRef
+
+  def __init__(self, ref_aval: ShapedArrayRef):
+    self.ref_aval = ref_aval
+
+  def __hash__(self):
+    return hash((self.__class__, self.ref_aval))
+
+  def __eq__(self, other):
+    return isinstance(other, self.__class__) and self.ref_aval is other.ref_aval
+
+class ReadEffect(StateEffect):
+
   def __repr__(self):
-    return "State"
-  __str__ = __repr__
-StateEffect = _StateEffect()
+    return f"Read<{self.ref_aval}>"
+
+class WriteEffect(StateEffect):
+
+  def __repr__(self):
+    return f"Write<{self.ref_aval}>"
+
+class AccumEffect(StateEffect):
+
+  def __repr__(self):
+    return f"Accum<{self.ref_aval}>"
+
 
 # ## `Ref`s
 

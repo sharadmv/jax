@@ -164,6 +164,16 @@ class CheckifyTrace(core.Trace):
     if rule:
       out, self.main.error = rule(self.main.error, self.main.enabled_errors,  # type: ignore
                                   *in_vals, **params)
+      import jax.debug
+      # jax.debug.breakpoint(backend="cli", num_frames=1)
+      # def _true_fun(err):
+      #   jax.debug.print("HELLO WORLD")
+      # def _false_fun(err):
+      #   return
+      # old_rule = error_checks.pop(lax.cond_p)
+      # lax.cond(self.main.error.err,
+      #     _true_fun, _false_fun, self.main.error)
+      # error_checks[lax.cond_p] = old_rule
     else:
       out = primitive.bind(*in_vals, **params)
     if primitive.multiple_results:

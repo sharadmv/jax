@@ -1606,6 +1606,9 @@ class DynamicJaxprTrace(core.Trace):
   pure = lift = new_const
 
   def _new_const(self, aval, c):
+    from jax._src.checkify import CheckifyTrace
+    # if isinstance(c, core.Tracer) and isinstance(c._trace, CheckifyTrace):
+    #   breakpoint()
     tracer = DynamicJaxprTracer(self, aval, source_info_util.current())
     self.frame.tracers.append(tracer)
     self.frame.tracer_to_var[id(tracer)] = var = self.frame.newvar(aval)

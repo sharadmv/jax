@@ -28,8 +28,7 @@ from jax._src.debugger import cli_debugger
 
 # pylint: disable=g-import-not-at-top
 # pytype: disable=import-error
-if colab_lib.IS_COLAB_ENABLED:
-  from google.colab import output
+  # from google.colab import output
 try:
   import pygments
   IS_PYGMENTS_ENABLED = True
@@ -37,6 +36,7 @@ except ImportError:
   IS_PYGMENTS_ENABLED = False
 # pytype: enable=import-error
 # pylint: enable=g-import-not-at-top
+from IPython import display
 
 
 class CodeViewer(colab_lib.DynamicDOMElement):
@@ -62,8 +62,9 @@ class CodeViewer(colab_lib.DynamicDOMElement):
     self._view.update(elem)
 
   def _highlight_code(self, code: str, highlights, linenostart: int):
-    is_dark_mode = output.eval_js(
-        'document.documentElement.matches("[theme=dark]");')
+    # is_dark_mode = output.eval_js(
+    #     'document.documentElement.matches("[theme=dark]");')
+    is_dark_mode = False
     code_style = "monokai" if is_dark_mode else "default"
     hl_color = "#4e56b7" if is_dark_mode else "#fff7c1"
     if IS_PYGMENTS_ENABLED:
@@ -104,12 +105,12 @@ class CodeViewer(colab_lib.DynamicDOMElement):
       percent_scroll = 0.
     self.update(code_div)
     # Scroll to where the line is
-    output.eval_js("""
-    console.log("{id}")
-    var elem = document.getElementById("{id}")
-    var maxScrollPosition = elem.scrollHeight - elem.clientHeight;
-    elem.scrollTop = maxScrollPosition * {percent_scroll}
-    """.format(id=f"code-{uuid_}", percent_scroll=percent_scroll))
+    # output.eval_js("""
+    # console.log("{id}")
+    # var elem = document.getElementById("{id}")
+    # var maxScrollPosition = elem.scrollHeight - elem.clientHeight;
+    # elem.scrollTop = maxScrollPosition * {percent_scroll}
+    # """.format(id=f"code-{uuid_}", percent_scroll=percent_scroll))
 
 
 class FramePreview(colab_lib.DynamicDOMElement):
@@ -160,13 +161,12 @@ class FramePreview(colab_lib.DynamicDOMElement):
             colab_lib.pre(colab_lib.code(f"{html.escape(filename)}({lineno})")),
             style=colab_lib.style({
                 "padding": "5px 5px 5px 5px",
-                "background-color": "var(--colab-highlighted-surface-color)",
+                "background-color": "#e0e0e0",
             })))
     self._code_view.update_code(source, [highlight], linenostart=linenostart)
 
   def render(self):
     self.update_frame(self.frame)
-
 
 class DebuggerView(colab_lib.DynamicDOMElement):
   """Main view for the Colab debugger."""
@@ -179,8 +179,8 @@ class DebuggerView(colab_lib.DynamicDOMElement):
         colab_lib.div(
             colab_lib.span("Breakpoint"),
             style=colab_lib.style({
-                "background-color": "var(--colab-secondary-surface-color)",
-                "color": "var(--colab-primary-text-color)",
+                "background-color": "#f7f7f7",
+                "color": "#212121",
                 "padding": "5px 5px 5px 5px",
                 "font-weight": "bold",
             })))
@@ -211,9 +211,15 @@ class DebuggerView(colab_lib.DynamicDOMElement):
     raise NotImplementedError()
 
   def readline(self):
-    with output.use_tags(["stdin"]):
-      user_input = input() + "\n"
-    output.clear(output_tags=["stdin"])
+    user_input = input() + "\n"
+    display.display(display.Javascript("""
+      elems = document.getElementsByClassName("stream");
+      Array.from(elems).map((e) => {
+        console.log(e)
+        e.innerHTML = "";
+      });
+    """))
+    self._interaction_log.append(colab_lib.pre(user_input.strip()))
     return user_input
 
   def isatty(self):

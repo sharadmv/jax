@@ -22,15 +22,9 @@ import uuid
 
 from typing import Any, Dict, List, Union
 
-IS_COLAB_ENABLED = "google.colab" in sys.modules
-if IS_COLAB_ENABLED:
-  # pylint: disable=g-import-not-at-top
-  # pytype: disable=import-error
-  from google.colab import output
-  from IPython import display
-  # pytype: enable=import-error
-  # pylint: enable=g-import-not-at-top
+IS_COLAB_ENABLED = True
 
+from IPython import display
 
 class DOMElement(metaclass=abc.ABCMeta):
 
@@ -71,34 +65,35 @@ class DynamicDiv(DynamicDOMElement):
   def __post_init__(self):
     self._uuid = str(uuid.uuid4())
     self._rendered = False
-    self._root_elem = div(id=self.tag)
+    self._root_elem = div(self.elem)
 
-  @property
-  def tag(self):
-    return f"tag-{self._uuid}"
+  def _as_html(self):
+    return display.HTML(self._root_elem.html())
 
   def render(self):
     if self._rendered:
       raise ValueError("Can't call `render` twice.")
-    self._root_elem.render()
+    self._handle = display.display(self._as_html(), display_id=self._uuid)
     self._rendered = True
-    self.append(self.elem)
 
   def append(self, child: DOMElement):
     if not self._rendered:
       self.render()
-    with output.use_tags([self.tag]):
-      with output.redirect_to_element(f"#{self.tag}"):
-        child.render()
+    children = self._root_elem.children
+    self._root_elem = div(*children, child)
+    self._handle.update(self._as_html())
 
   def update(self, elem: DOMElement):
-    self.clear()
-    self.elem = elem
-    self.render()
+    if not self._rendered:
+      self.render()
+    self._root_elem = div(elem)
+    self._handle.update(self._as_html())
 
   def clear(self):
-    output.clear(output_tags=[self.tag])
-    self._rendered = False
+    if not self._rendered:
+      self.render()
+    self._root_elem = div()
+    self._handle.update(self._as_html())
 
 
 @dataclasses.dataclass
@@ -108,6 +103,9 @@ class StaticDOMElement(DOMElement):
   name: str
   children: List[Union[str, DOMElement]]
   attrs: Dict[str, str]
+
+  def __repr_html__(self):
+    return self.html()
 
   def html(self):
     attr_str = ""
@@ -119,7 +117,7 @@ class StaticDOMElement(DOMElement):
     return f"<{self.name}{attr_str}>{children}</{self.name}>"
 
   def render(self):
-    display.display(display.HTML(self.html()))
+    return display.display(display.HTML(self.html()))
 
   def attr(self, key: str) -> str:
     return self.attrs[key]

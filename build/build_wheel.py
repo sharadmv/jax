@@ -73,6 +73,7 @@ def copy_file(src_file, dst_dir, dst_filename=None, from_runfiles=True):
     src_file = r.Rlocation(src_file)
 
   src_filename = os.path.basename(src_file)
+  print(src_file, dst_dir, dst_filename)
   dst_file = os.path.join(dst_dir, dst_filename or src_filename)
   if _is_windows():
     shutil.copyfile(src_file, dst_file)
@@ -249,6 +250,12 @@ def prepare_wheel(sources_path):
   if exists("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client_extension.so"):
     copy_to_jaxlib("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client_extension.so")
     patch_copy_tpu_client_py(jaxlib_dir)
+
+  jaxlib_include_dir = os.path.join(jaxlib_dir, "include")
+  os.makedirs(jaxlib_include_dir)
+
+  copy_to_jaxlib("__main__/jaxlib/jax_custom_call.h", dst_dir=jaxlib_include_dir)
+  print(jaxlib_include_dir)
 
 
 def edit_jaxlib_version(sources_path):

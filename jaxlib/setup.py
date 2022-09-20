@@ -70,6 +70,7 @@ setup(
             'mlir/_mlir_libs/*.pyd',
             'mlir/_mlir_libs/*.py',
             'rocm/*',
+            'include/*',
         ],
         'jaxlib.xla_extension': ['*.pyi'],
     },

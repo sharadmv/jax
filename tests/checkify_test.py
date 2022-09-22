@@ -28,7 +28,7 @@ from jax.experimental import pjit
 from jax.experimental import maps
 from jax.experimental.sharding import MeshPspecSharding
 from jax.experimental import array
-from jax._src.checkify import CheckEffect
+from jax._src.checkify import ErrorEffect, ErrorCategory
 import jax.numpy as jnp
 
 config.parse_flags_with_absl()
@@ -676,7 +676,8 @@ class AssertPrimitiveTests(jtu.JaxTestCase):
     def f():
       checkify.check(False, "hi")
 
-    self.assertSetEqual(jax.make_jaxpr(f)().effects, {CheckEffect})
+    self.assertSetEqual(jax.make_jaxpr(f)().effects,
+                        {ErrorEffect(ErrorCategory.USER_CHECK)})
 
   def test_assert_primitive_eval_shape(self):
     # The check is abstractly evaluated but not lowered.

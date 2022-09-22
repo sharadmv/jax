@@ -16,7 +16,7 @@ import enum
 from dataclasses import dataclass
 from functools import partial
 import itertools as it
-from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable
+from typing import Any, Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable, Type
 
 import numpy as np
 
@@ -473,11 +473,18 @@ def assert_impl(err, code, payload, *, msgs):
   Error(err, code, msgs, payload).throw()
   return []
 
-CheckEffect = object()
+ErrorCategory = enum.Enum('ErrorCategory', ['NAN', 'OOB', 'DIV', 'USER_CHECK'])
+
+class JaxError(Exception):
+  pass
+
+@dataclass(frozen=True)
+class ErrorEffect:
+  category: ErrorCategory
 
 @assert_p.def_effectful_abstract_eval
 def assert_abstract_eval(err, code, payload, *, msgs):
-  return [], {CheckEffect}
+  return [], {ErrorEffect(ErrorCategory.USER_CHECK)}
 
 def assert_lowering_rule(*a, **k):
   # TODO(lenamartens): actually throw an error through emit_python_callable
@@ -488,8 +495,9 @@ def assert_lowering_rule(*a, **k):
                    ' through `checkify.checkify`.'
                    )
 mlir.register_lowering(assert_p, assert_lowering_rule)
-mlir.lowerable_effects.add(CheckEffect)
-cf.allowed_effects.add(CheckEffect)
+for category in ErrorCategory:
+  mlir.lowerable_effects.add(ErrorEffect(category))
+  cf.allowed_effects.add(ErrorEffect(category))
 
 
 def assert_batching_rule(batched_args, batch_dims, *, msgs):
@@ -844,8 +852,6 @@ error_checks[assert_p] = assert_discharge_rule
 
 
 ## checkify api
-
-ErrorCategory = enum.Enum('ErrorCategory', ['NAN', 'OOB', 'DIV', 'USER_CHECK'])
 
 user_checks = frozenset({ErrorCategory.USER_CHECK})
 nan_checks = frozenset({ErrorCategory.NAN})

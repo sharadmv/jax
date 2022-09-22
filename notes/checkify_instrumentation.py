@@ -18,12 +18,6 @@ import enum
 import contextlib
 
 
-class Check(enum.Enum):
-  DIV_BY_ZERO = enum.auto()
-  INVALID_NAN = enum.auto()
-
-cf.allowed_effects.add(Check.DIV_BY_ZERO)
-
 _active_checks: list[frozenset[Check]] = [frozenset()]
 
 @contextlib.contextmanager
@@ -39,19 +33,22 @@ div_p = core.Primitive('div')
 
 @div_p.def_impl
 def _div_impl(x, y, *, check):
-  if check and y == 0:
-    raise ZeroDivisionError("division by zero")
+  if check:
+    # Could do effectful lowering
+    raise ValueError("Cannot execute effectful `div`.")
   return jnp.divide(x, y)
 
 @div_p.def_effectful_abstract_eval
 def _div_abstract_eval(x, y, *, check):
   if check:
-    return x, {Check.DIV_BY_ZERO}
+    return x, {checkify.ErrorCategory.DIV}
   return x, set()
 
-def _div_error_check(error, _, x, y, *, check):
+def _div_error_check(error, error_categories, x, y, *, check):
   if not check:
     return div_p.bind(x, y, check=False), error
+  if checkify.ErrorCategory.DIV not in error_categories:
+    return div_p.bind(x, y, check=True), error
   any_zero = jnp.any(jnp.equal(y, 0))
   msg = f'divided by zero at {checkify.summary()}'
   error = checkify.assert_func(error, any_zero, msg, None)
@@ -60,10 +57,10 @@ checkify.error_checks[div_p] = _div_error_check
 
 def _div_lowering(ctx, x, y, *, check):
   if check:
-    raise ValueError("Cannot lower function with effects.")
+    # Could do effectful lowering
+    raise ValueError("Cannot execute effectful `div`.")
   return _nary_lower_mhlo(mhlo.DivOp, ctx, x, y)
 mlir.register_lowering(div_p, _div_lowering)
-
 
 ad.defjvp(div_p,
           lambda g, x, y, check: div_p.bind(g, y, check=check),
@@ -78,14 +75,14 @@ def _div_transpose_rule(cotangent, x, y, *, check):
 ad.primitive_transposes[div_p] = _div_transpose_rule
 
 def div(x, y):
-  should_check = Check.DIV_BY_ZERO in _current_checks()
+  should_check = checkify.ErrorCategory.DIV in _current_checks()
   return div_p.bind(x, y, check=should_check)
 
 @jax.jit
 @jax.grad
 def f(x, y):
   z = div(x, 0.)
-  with instrument(Check.DIV_BY_ZERO):
+  with instrument(checkify.ErrorCategory.DIV):
     return div(z, y)
 
 jaxpr = jax.make_jaxpr(f)(1., 0.).jaxpr
@@ -94,5 +91,5 @@ print(jaxpr, jaxpr.effects)
 checkify_jaxpr = jax.make_jaxpr(checkify.checkify(f))(1., 0.).jaxpr
 print(checkify_jaxpr, checkify_jaxpr.effects)
 
-err, out = checkify.checkify(f)(1., 0.)
-err.throw()
+err, out = checkify.checkify(f, checkify.all_checks)(1., 0.)  # Catches the error!
+err, out = checkify.checkify(f, checkify.user_checks)(1., 0.)  # Does not catch!

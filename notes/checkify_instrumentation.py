@@ -1,13 +1,17 @@
 from __future__ import annotations
+from functools import partial
 
 from typing import Any
 
 import jax
 from jax import core
 from jax import lax
-from jax._src.lax.lax import _unbroadcast
+from jax._src.lax.lax import _unbroadcast, _nary_lower_mhlo
 from jax.interpreters import ad
+from jax.interpreters import mlir
+from jax._src.lib.mlir.dialects import mhlo
 from jax._src import ad_util
+from jax._src import checkify
 from jax._src.lax import control_flow as cf
 import jax.numpy as jnp
 import enum
@@ -35,7 +39,8 @@ div_p = core.Primitive('div')
 
 @div_p.def_impl
 def _div_impl(x, y, *, check):
-  if check and y == 0: raise ZeroDivisionError("division by zero")
+  if check and y == 0:
+    raise ZeroDivisionError("division by zero")
   return jnp.divide(x, y)
 
 @div_p.def_effectful_abstract_eval
@@ -43,6 +48,22 @@ def _div_abstract_eval(x, y, *, check):
   if check:
     return x, {Check.DIV_BY_ZERO}
   return x, set()
+
+def _div_error_check(error, _, x, y, *, check):
+  if not check:
+    return div_p.bind(x, y, check=False), error
+  any_zero = jnp.any(jnp.equal(y, 0))
+  msg = f'divided by zero at {checkify.summary()}'
+  error = checkify.assert_func(error, any_zero, msg, None)
+  return div_p.bind(x, y, check=False), error
+checkify.error_checks[div_p] = _div_error_check
+
+def _div_lowering(ctx, x, y, *, check):
+  if check:
+    raise ValueError("Cannot lower function with effects.")
+  return _nary_lower_mhlo(mhlo.DivOp, ctx, x, y)
+mlir.register_lowering(div_p, _div_lowering)
+
 
 ad.defjvp(div_p,
           lambda g, x, y, check: div_p.bind(g, y, check=check),
@@ -60,19 +81,18 @@ def div(x, y):
   should_check = Check.DIV_BY_ZERO in _current_checks()
   return div_p.bind(x, y, check=should_check)
 
+@jax.jit
 @jax.grad
 def f(x, y):
-  z = div(x, y)
+  z = div(x, 0.)
   with instrument(Check.DIV_BY_ZERO):
-    def body(i, x):
-      x = div(x, y)
-      return x
-    return lax.fori_loop(0, 5, body, z)
-
-print("f(2., 1.)", f(2., 1.))
-print("f(1., 0.)", f(1., 0.))
+    return div(z, y)
 
 jaxpr = jax.make_jaxpr(f)(1., 0.).jaxpr
-print(jaxpr)
-print(jaxpr.effects)
-print(jax.make_jaxpr(lambda x, y: core.eval_jaxpr(jaxpr, (), x, y))(1, 0))
+print(jaxpr, jaxpr.effects)
+
+checkify_jaxpr = jax.make_jaxpr(checkify.checkify(f))(1., 0.).jaxpr
+print(checkify_jaxpr, checkify_jaxpr.effects)
+
+err, out = checkify.checkify(f)(1., 0.)
+err.throw()

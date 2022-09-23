@@ -18,10 +18,10 @@ import enum
 import contextlib
 
 
-_active_checks: list[frozenset[Check]] = [frozenset()]
+_active_checks: list[frozenset[checkify.ErrorCategory]] = [frozenset()]
 
 @contextlib.contextmanager
-def instrument(*checks: Check):
+def instrument(*checks: checkify.ErrorCategory):
   _active_checks.append(frozenset(checks))
   yield
   _active_checks.pop()

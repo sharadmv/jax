@@ -76,20 +76,25 @@ ad.primitive_transposes[div_p] = _div_transpose_rule
 
 def div(x, y):
   should_check = checkify.ErrorCategory.DIV in _current_checks()
+  if should_check:
+    x = jax.core.raise_as_much_as_possible(x)
+    y = jax.core.raise_as_much_as_possible(y)
   return div_p.bind(x, y, check=should_check)
 
 @jax.jit
-@jax.grad
 def f(x, y):
-  z = div(x, 0.)
-  with instrument(checkify.ErrorCategory.DIV):
-    return div(z, y)
+  def g(z, y):
+    with instrument(checkify.ErrorCategory.DIV):
+      return div(z, y)
+  # Try catch?
+  err, out = checkify.checkify(g, checkify.div_checks)(z, y)
+  return lax.cond(err.err, lambda: jnp.nan, lambda: out)
 
 jaxpr = jax.make_jaxpr(f)(1., 0.).jaxpr
 print(jaxpr, jaxpr.effects)
 
-checkify_jaxpr = jax.make_jaxpr(checkify.checkify(f))(1., 0.).jaxpr
-print(checkify_jaxpr, checkify_jaxpr.effects)
+checkify_jaxpr = jax.make_jaxpr(checkify.checkify(f, checkify.all_checks))(2., 0.).jaxpr
+print(checkify_jaxpr)
 
-err, out = checkify.checkify(f, checkify.all_checks)(1., 0.)  # Catches the error!
-err, out = checkify.checkify(f, checkify.user_checks)(1., 0.)  # Does not catch!
+print(f(1., 2.)) # 0.5
+print(f(1., 0.)) # nan

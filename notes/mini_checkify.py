@@ -63,6 +63,9 @@ class Error:
     return (ctor_vals, list(self.pred.values()), list(self.code.values())), (self.pred.keys(),
         self.code.keys(), ctor_funcs, ctor_keys, self._counter)
 
+  def has_error(self):
+    return jnp.any(jnp.asarray(list(self.pred.values())))
+
   @classmethod
   def tree_unflatten(cls, data, xs):
     ctor_vals, pred_vals, code_vals = xs
@@ -288,6 +291,11 @@ def _assert_discharge_rule(error, error_types, pred, *args, fmt, tree):
   return error, []
 discharge_rules[assert_p] = _assert_discharge_rule
 
+def try_except_then(f, error_types, handler, *args, **kwargs):
+  error, out = discharge_errors(f, error_types)(*args, **kwargs)
+  return lax.cond(error.has_error(), lambda: handler(*args, **kwargs),
+                  lambda: out)
+                  
 
 def f(x, y):
   z = div(x, y)
@@ -297,10 +305,8 @@ def f(x, y):
 
 @jax.jit
 def g(x, y):
-  error, out = discharge_errors(f, {DivideByZero, AssertionError})(x, y)
-  raise_(error)
-  return out
+  return try_except_then(f, {DivideByZero}, lambda x, y: -1., x, y)
 
-print(jax.make_jaxpr(g)(1., 1.).effects)
-error, out = discharge_errors(g, {AssertionError})(1., 0.)
-raise_(error)
+print(jax.make_jaxpr(g)(1., 1.).effects)  # AssertionError
+error, out = discharge_errors(g, {AssertionError})(1., 1.)
+raise_(error)  # Raises assertion

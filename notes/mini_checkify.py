@@ -265,31 +265,14 @@ def _div_error_discharge_rule(error: Error, error_types, x, y, *, should_check: 
 discharge_rules[div_p] = _div_error_discharge_rule
 div = functools.partial(div_p.bind, should_check=True)
 
-assert_p = core.Primitive("assert")
-assert_p.multiple_results = True
-
 def assert_(pred, fmt, *args, **kwargs):
+  error = init_error(frozenset({AssertionError}))
   flat_args, tree = tree_flatten((args, kwargs))
-  return assert_p.bind(pred, *flat_args, tree=tree, fmt=fmt)
-
-def _assert_impl(pred, *args, fmt, tree):
-  if not pred:
-    format_args, format_kwargs = tree_unflatten(tree, args)
-    raise AssertionError(fmt, *format_args, **format_kwargs)
-  return []
-assert_p.def_impl(_assert_impl)
-
-def _assert_abstract_eval(pred, *args, fmt, tree):
-  return [], {AssertionError}
-assert_p.def_effectful_abstract_eval(_assert_abstract_eval)
-
-def _assert_discharge_rule(error, error_types, pred, *args, fmt, tree):
   def _factory(*args):
     format_args, format_kwargs = tree_unflatten(tree, args)
     return AssertionError(fmt, *format_args, **format_kwargs)
-  error = error.update(AssertionError, ~pred, _factory, *args)
-  return error, []
-discharge_rules[assert_p] = _assert_discharge_rule
+  error = error.update(AssertionError, ~pred, _factory, *flat_args)
+  return raise_(error)
 
 def try_except_then(f, error_types, handler, *args, **kwargs):
   error, out = discharge_errors(f, error_types)(*args, **kwargs)

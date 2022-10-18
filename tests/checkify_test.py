@@ -102,7 +102,6 @@ class CheckifyTransformTests(jtu.JaxTestCase):
 
     err, _ = checked_f(jnp.ones((3,)), jnp.array([1., 0., 1.]))
     self.assertIsNotNone(err.get())
-    self.assertStartsWith(err.get(), "division by zero")
 
     err, _ = checked_f(jnp.array([1, jnp.inf, 1]), jnp.array([1, jnp.inf, 1]))
     self.assertIsNotNone(err.get())

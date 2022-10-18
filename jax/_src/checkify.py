@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import functools
+import traceback
 import enum
 from dataclasses import dataclass
 from functools import partial
 import itertools as it
-from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable
+from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable, Type, Any
 
 import numpy as np
 
@@ -24,7 +27,7 @@ import jax.numpy as jnp
 
 from jax import core
 from jax import linear_util as lu
-from jax.api_util import flatten_fun
+from jax.api_util import flatten_fun, flatten_fun_nokwargs
 from jax.experimental import pjit
 from jax.experimental import maps
 from jax.interpreters import ad
@@ -32,7 +35,7 @@ from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax._src.sharding import OpShardingSharding
-from jax.tree_util import tree_flatten, tree_unflatten, register_pytree_node
+from jax.tree_util import tree_flatten, tree_unflatten, register_pytree_node, register_pytree_node_class, tree_structure, tree_map
 from jax._src import source_info_util, traceback_util
 from jax._src.lax import control_flow as cf
 from jax._src.config import config
@@ -79,36 +82,102 @@ def _format_msg(msg, payloads):
     payload_mapping[f'payload{i}'] = pl
   return msg.format(**payload_mapping)
 
+@register_pytree_node_class
+class JaxError(Exception):
+  def __init__(self, source_info):
+    self.source_info = source_info
+
+  def tree_flatten(self):
+    return ([], self.source_info)
+
+  @classmethod
+  def tree_unflatten(cls, source_info, _):
+    return cls(source_info)
+
+@register_pytree_node_class
+class DivideByZero(JaxError):
+
+  def __str__(self):
+    return f"Divide by zero! at {self.source_info}"
+
+  def __repr__(self):
+    return "DivideByZero"
+
+@register_pytree_node_class
+class NaN(JaxError):
+
+  def __init__(self, source_info, primitive_name):
+    self.source_info = source_info
+    self.prim = primitive_name
+
+  def tree_flatten(self):
+    return ([], (self.source_info, self.prim))
+
+  @classmethod
+  def tree_unflatten(cls, metadata, _):
+    return cls(*metadata)
+
+  def __str__(self):
+    return f"Primitive {self.prim} output was NaN! at {self.source_info}"
+
+  def __repr__(self):
+    return "NaN"
+
+@register_pytree_node_class
+class OOB(JaxError):
+
+  def __init__(self, source_info, primitive_name, operand_shape, payload):
+    self.source_info = source_info
+    self.prim = primitive_name
+    self.operand_shape = operand_shape
+    self.payload = payload
+
+  def tree_flatten(self):
+    return (self.payload, (self.source_info, self.prim, self.operand_shape))
+
+  @classmethod
+  def tree_unflatten(cls, metadata, payload):
+    return cls(*metadata, payload)
+
+  def __str__(self):
+    return (f'out-of-bounds indexing at {self.source_info} for array of '
+            f'shape {self.operand_shape}: '
+            f'index {self.payload[0]} is out of bounds for axis {self.payload[1]} '
+            f'with size {self.payload[2]}.')
+
+  def __repr__(self):
+    return "OOB"
+
+PyTreeDef = Any
+TypeID = Any
 
 @dataclass(frozen=True)
 class Error:
-  err: Bool
-  code: Int
-  msgs: Dict[int, str]
-  # There might be many msgs with a {payload}, but only one msg will
-  # ever be active for an Error instance, so only one Payload is tracked.
-  payload: Payload
+  err: dict[TypeID, Bool]
+  code: dict[TypeID, Int]
+  metadata: dict[Int, PyTreeDef]
+  payload: dict[Type[JaxError], Payload]
 
-  def __init__(self, err: Bool, code: Int, msgs: Dict[int, str], payload: Optional[Payload] = None):
-    # We can't directly assign to members of a frozen dataclass, even in __init__.
-    object.__setattr__(self, "err", err)
-    object.__setattr__(self, "code", code)
-    object.__setattr__(self, "msgs", msgs)
-    object.__setattr__(self, "payload",
-                       init_payload() if payload is None else payload)
+  def get(self) -> Optional[JaxError]:
+    """Returns error obj is error happened, None if no error happened."""
+    min_code = None
+    curtype = None
+    for errortype, code in self.code.items():
+      if self.err[errortype]:
+        if min_code is None or code < min_code:
+          min_code = code
+          curtype = errortype
 
-  def get(self) -> Optional[str]:
-    """Returns error message is error happened, None if no error happened."""
-    assert np.shape(self.err) == np.shape(self.code)
-    if np.size(self.err) == 1:
-      if self.err:
-        return _format_msg(self.msgs[int(self.code)], self.payload)
-    else:
-      return '\n'.join(
-          f'at mapped index {", ".join(map(str, idx))}: '  # type: ignore
-          f'{_format_msg(self.msgs[int(self.code[idx])], self.payload[idx])}'  # type: ignore
-          for idx, e in np.ndenumerate(self.err) if e) or None
+    if curtype is not None:
+      return tree_unflatten(self.metadata[int(min_code)], self.payload[curtype])
     return None
+
+  def update(self, error_type: Type[JaxError], err, code, metadata, payload):
+    new_errs = self.err | {id(error_type): err}
+    new_codes = self.code | {id(error_type): code}
+    new_payload = self.payload | {id(error_type): payload}
+    new_metadata = self.metadata | metadata
+    return Error(new_errs, new_codes, new_metadata, new_payload)
 
   def throw(self):
     check_error(self)
@@ -120,27 +189,29 @@ class Error:
 def raise_error(error):
   err = error.get()
   if err:
-    raise ValueError(err)
+    raise err
 
 
 register_pytree_node(Error,
-                     lambda e: ((e.err, e.code, e.payload),
-                                tuple(sorted(e.msgs.items()))),
-                     lambda msgs, data: Error(data[0], data[1],  # type: ignore
-                                              dict(msgs), data[2]))  # type: ignore
+                     lambda e: ((e.err, e.code, e.payload), (e.metadata)),
+                     lambda metadata, data: Error(data[0], data[1], metadata, data[2]))
 
-init_error = Error(False, 0, {})
+init_error = Error({}, {}, {}, {})
 next_code = it.count(1).__next__  # globally unique ids, could be uuid4
 
 
-def assert_func(error: Error, err: Bool, msg: str,
-                payload: Optional[Payload]) -> Error:
+def assert_func(error: Error, err: Bool, new_error: JaxError) -> Error:
   code = next_code()
-  payload = init_payload() if payload is None else payload
-  out_err = error.err | err
-  out_code = lax.select(error.err, error.code, code)
-  out_payload = lax.select(error.err, error.payload, payload)
-  return Error(out_err, out_code, {code: msg, **error.msgs}, out_payload)
+  err_of_type = error.err.get(id(type(new_error)), False)
+  out_err = err_of_type | err
+  out_code = lax.select(err_of_type, error.code.get(id(type(new_error)), -1), code)
+  cur_payload = error.payload.get(id(type(new_error)), None)
+  new_payload, new_metadata = tree_flatten(new_error)
+  if cur_payload is not None:
+    out_payload = tree_map(functools.partial(lax.select, err_of_type), cur_payload, new_payload)
+  else:
+    out_payload = new_payload
+  return error.update(type(new_error), out_err, out_code, {code: new_metadata}, out_payload)
 
 
 ## Checkify transformation for plumbing functional error values.
@@ -181,19 +252,23 @@ class CheckifyTrace(core.Trace):
   def process_call(self, primitive, f, tracers, params):
     in_vals = [t.val for t in tracers]
     e = popattr(self.main, 'error')
-    f, msgs = checkify_subtrace(f, self.main, tuple(e.msgs.items()))
+    # flatten full error obj
+    flat_vals, in_tree = tree_flatten((e, *in_vals))
+    # make sure this takes error -> error
+    f = checkify_subtrace(f, self.main)
+    f, out_tree = flatten_fun_nokwargs(f, in_tree)
     if 'donated_invars' in params:
       params = dict(params, donated_invars=(False, False, False,
                                             *params['donated_invars']))
-    err, code, payload, *out_vals = primitive.bind(f, e.err, e.code, e.payload,
-                                                   *in_vals, **params)
-    setnewattr(self.main, 'error', Error(err, code, msgs(), payload))
+    all_vals = primitive.bind(f, *flat_vals, **params)
+    error, *out_vals = tree_unflatten(out_tree(), all_vals)
+    setnewattr(self.main, 'error', error)
     return [CheckifyTracer(self, x) for x in out_vals]
 
   def process_map(self, primitive, f, tracers, params):
     in_vals = [t.val for t in tracers]
     e = popattr(self.main, 'error')
-    f, msgs = checkify_subtrace(f, self.main, tuple(e.msgs.items()))
+    f, msgs = checkify_subtrace(f, self.main)
 
     @as_hashable_function(closure=params['out_axes_thunk'])
     def new_out_axes_thunk():
@@ -289,31 +364,29 @@ error_checks: Dict[core.Primitive, ErrorCheckRule] = {}
 
 def checkify_flat(fun: lu.WrappedFun, enabled_errors: FrozenSet['ErrorCategory'],
                   *args):
-  fun, msgs = checkify_subtrace(fun)
-  fun = checkify_traceable(fun, tuple(init_error.msgs.items()), enabled_errors)
-  err, code, payload, *outvals = fun.call_wrapped(init_error.err,
-                                                  init_error.code,
-                                                  init_error.payload, *args)
-  return (err, code, payload, outvals), msgs()
+  fun = checkify_subtrace(fun)
+  fun = checkify_traceable(fun, enabled_errors)
+  error, *outvals = fun.call_wrapped(init_error, *args)
+  return error, outvals
 
 @lu.transformation
-def checkify_traceable(msgs, enabled_errors, err, code, payload, *args):
+def checkify_traceable(enabled_errors, error, *args):
   with core.new_main(CheckifyTrace, enabled_errors=enabled_errors) as main:
-    outs = yield (main, msgs, err, code, payload, *args), {}
+    outs = yield (main, error, *args), {}
     del main
   yield outs
 
-@lu.transformation_with_aux
-def checkify_subtrace(main, msgs, err, code, payload, *args):
-  setnewattr(main, 'error', Error(err, code, dict(msgs), payload))
+@lu.transformation
+def checkify_subtrace(main, error, *args):
+  setnewattr(main, 'error', error)
   trace = main.with_cur_sublevel()
   in_tracers = [CheckifyTracer(trace, x) for x in args]
   out = yield in_tracers, {}
   out_tracers = map(trace.full_raise, out)
   out_vals = [t.val for t in out_tracers]
-  err, code, payload, msgs = main.error.err, main.error.code, main.error.payload, main.error.msgs
+  error = main.error
   del main.error
-  yield (err, code, payload, *out_vals), msgs
+  yield (error, *out_vals)
 
 @lu.transformation_with_aux
 def checkify_custom_jvp_subtrace(main, msgs, *args):
@@ -561,7 +634,7 @@ def nan_error_check(prim, error, enabled_errors, *in_vals, **params):
     return out, error
   any_nans = jnp.any(jnp.isnan(out))
   msg = f'nan generated by primitive {prim.name} at {summary()}'
-  return out, assert_func(error, any_nans, msg, None)
+  return out, assert_func(error, any_nans, NaN(summary(), prim.name))
 
 def gather_error_check(error, enabled_errors, operand, start_indices, *,
                        dimension_numbers, slice_sizes, unique_indices,
@@ -597,7 +670,7 @@ def gather_error_check(error, enabled_errors, operand, start_indices, *,
          'index {payload0} is out of bounds for axis {payload1} '
          'with size {payload2}.')
 
-  return out, assert_func(error, jnp.any(out_of_bounds), msg, payload)
+  return out, assert_func(error, jnp.any(out_of_bounds), OOB(summary(), "gather", operand.shape, payload))
 error_checks[lax.gather_p] = gather_error_check
 
 def div_error_check(error, enabled_errors, x, y):
@@ -605,7 +678,7 @@ def div_error_check(error, enabled_errors, x, y):
   if ErrorCategory.DIV in enabled_errors:
     any_zero = jnp.any(jnp.equal(y, 0))
     msg = f'division by zero at {summary()}'
-    error = assert_func(error, any_zero, msg, None)
+    error = assert_func(error, any_zero, DivideByZero(summary()))
   return nan_error_check(lax.div_p, error, enabled_errors, x, y)
 error_checks[lax.div_p] = div_error_check
 
@@ -961,7 +1034,7 @@ def checkify(fun: Callable[..., Out],
   def checked_fun(*args, **kwargs):
     args_flat, in_tree = tree_flatten((args, kwargs))
     f, out_tree = flatten_fun(lu.wrap_init(fun), in_tree)
-    (err, code, payload, out_flat), msgs = checkify_flat(f, errors, *args_flat)
+    error, out_flat = checkify_flat(f, errors, *args_flat)
     out = tree_unflatten(out_tree(), out_flat)
-    return Error(err, code, msgs, payload), out
+    return error, out
   return checked_fun

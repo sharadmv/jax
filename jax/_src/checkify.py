@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+import abc
 import functools
 import enum
 import types
@@ -89,7 +89,7 @@ class JaxRuntimeError(Exception):
 
 
 @register_pytree_node_class
-class JaxError(Exception):
+class JaxError(Exception, metaclass=abc.ABCMeta):
   def __init__(self, source_info):
     self.source_info = source_info
     self.with_traceback(self.source_info)
@@ -101,14 +101,23 @@ class JaxError(Exception):
   def tree_unflatten(cls, source_info, _):
     return cls(source_info)
 
+  @abc.abstractmethod
+  def get_effect_type(self) -> core.Effect:
+    pass
+
+@dataclass(frozen=True)
+class ErrorEffect:
+  error_type: Type[JaxError]
+  shape_dtypes: Tuple[Any]
+
 @register_pytree_node_class
 class DivideByZero(JaxError):
 
   def __str__(self):
     return f"Divide by zero!"
 
-  def __repr__(self):
-    return "DivideByZero"
+  def get_effect_type(self):
+    return ErrorEffect(DivideByZero, ())
 
 @register_pytree_node_class
 class NaN(JaxError):
@@ -124,11 +133,11 @@ class NaN(JaxError):
   def tree_unflatten(cls, metadata, _):
     return cls(*metadata)
 
+  def get_effect_type(self):
+    return ErrorEffect(NaN, ())
+
   def __str__(self):
     return f"Primitive {self.prim} output was NaN!"
-
-  def __repr__(self):
-    return "NaN"
 
 @register_pytree_node_class
 class OOB(JaxError):
@@ -152,37 +161,37 @@ class OOB(JaxError):
             f'index {self.payload[0]} is out of bounds for axis {self.payload[1]} '
             f'with size {self.payload[2]}.')
 
-  def __repr__(self):
-    return "OOB"
+  def get_effect_type(self):
+    return ErrorEffect(OOB, ())
 
 PyTreeDef = Any
-TypeID = Any
 
 @dataclass(frozen=True)
 class Error:
-  err: dict[TypeID, Bool]
-  code: dict[TypeID, Int]
+  err: dict[ErrorEffect, Bool]
+  code: dict[ErrorEffect, Int]
   metadata: dict[Int, PyTreeDef]
-  payload: dict[Type[JaxError], Payload]
+  payload: dict[ErrorEffect, Payload]
 
   def get(self) -> Optional[JaxError]:
     """Returns error obj is error happened, None if no error happened."""
     min_code = None
-    curtype = None
-    for errortype, code in self.code.items():
-      if self.err[errortype]:
+    cur_effect = None
+    for error_effect, code in self.code.items():
+      if self.err[error_effect]:
         if min_code is None or code < min_code:
           min_code = code
-          curtype = errortype
+          cur_effect = error_effect
 
-    if curtype is not None:
-      return tree_unflatten(self.metadata[int(min_code)], self.payload[curtype])
+    if cur_effect is not None:
+      return tree_unflatten(self.metadata[int(min_code)],
+                            self.payload[cur_effect])
     return None
 
-  def update(self, error_type: Type[JaxError], err, code, metadata, payload):
-    new_errs = self.err | {id(error_type): err}
-    new_codes = self.code | {id(error_type): code}
-    new_payload = self.payload | {id(error_type): payload}
+  def update(self, effect_type: ErrorEffect, err, code, metadata, payload):
+    new_errs = self.err | {effect_type: err}
+    new_codes = self.code | {effect_type: code}
+    new_payload = self.payload | {effect_type: payload}
     new_metadata = self.metadata | metadata
     return Error(new_errs, new_codes, new_metadata, new_payload)
 
@@ -209,16 +218,17 @@ next_code = it.count(1).__next__  # globally unique ids, could be uuid4
 
 def assert_func(error: Error, err: Bool, new_error: JaxError) -> Error:
   code = next_code()
-  err_of_type = error.err.get(id(type(new_error)), False)
+  effect_type = new_error.get_effect_type()
+  err_of_type = error.err.get(effect_type, False)
   out_err = err_of_type | err
-  out_code = lax.select(err_of_type, error.code.get(id(type(new_error)), -1), code)
-  cur_payload = error.payload.get(id(type(new_error)), None)
+  out_code = lax.select(err_of_type, error.code.get(effect_type, -1), code)
+  cur_payload = error.payload.get(effect_type, None)
   new_payload, new_metadata = tree_flatten(new_error)
   if cur_payload is not None:
     out_payload = tree_map(functools.partial(lax.select, err_of_type), cur_payload, new_payload)
   else:
     out_payload = new_payload
-  return error.update(type(new_error), out_err, out_code, {code: new_metadata}, out_payload)
+  return error.update(effect_type, out_err, out_code, {code: new_metadata}, out_payload)
 
 
 ## Checkify transformation for plumbing functional error values.

@@ -14,8 +14,8 @@
 
 import sys
 import functools
-import traceback
 import enum
+import types
 from dataclasses import dataclass
 from functools import partial
 import itertools as it
@@ -82,10 +82,17 @@ def _format_msg(msg, payloads):
     payload_mapping[f'payload{i}'] = pl
   return msg.format(**payload_mapping)
 
+class JaxRuntimeError(Exception):
+
+  def __str__(self):
+    return "JAX runtime error encountered!"
+
+
 @register_pytree_node_class
 class JaxError(Exception):
   def __init__(self, source_info):
     self.source_info = source_info
+    self.with_traceback(self.source_info)
 
   def tree_flatten(self):
     return ([], self.source_info)
@@ -98,7 +105,7 @@ class JaxError(Exception):
 class DivideByZero(JaxError):
 
   def __str__(self):
-    return f"Divide by zero! at {self.source_info}"
+    return f"Divide by zero!"
 
   def __repr__(self):
     return "DivideByZero"
@@ -107,7 +114,7 @@ class DivideByZero(JaxError):
 class NaN(JaxError):
 
   def __init__(self, source_info, primitive_name):
-    self.source_info = source_info
+    super().__init__(source_info)
     self.prim = primitive_name
 
   def tree_flatten(self):
@@ -118,7 +125,7 @@ class NaN(JaxError):
     return cls(*metadata)
 
   def __str__(self):
-    return f"Primitive {self.prim} output was NaN! at {self.source_info}"
+    return f"Primitive {self.prim} output was NaN!"
 
   def __repr__(self):
     return "NaN"
@@ -127,7 +134,7 @@ class NaN(JaxError):
 class OOB(JaxError):
 
   def __init__(self, source_info, primitive_name, operand_shape, payload):
-    self.source_info = source_info
+    super().__init__(source_info)
     self.prim = primitive_name
     self.operand_shape = operand_shape
     self.payload = payload
@@ -140,7 +147,7 @@ class OOB(JaxError):
     return cls(*metadata, payload)
 
   def __str__(self):
-    return (f'out-of-bounds indexing at {self.source_info} for array of '
+    return (f'out-of-bounds indexing for array of '
             f'shape {self.operand_shape}: '
             f'index {self.payload[0]} is out of bounds for axis {self.payload[1]} '
             f'with size {self.payload[2]}.')
@@ -189,7 +196,7 @@ class Error:
 def raise_error(error):
   err = error.get()
   if err:
-    raise err
+    raise JaxRuntimeError() from err
 
 
 register_pytree_node(Error,
@@ -625,8 +632,22 @@ ad.primitive_jvps[assert_p] = assert_jvp_rule
 
 ## checkify rules
 
-def summary() -> str:
-  return str(source_info_util.summarize(source_info_util.current()))
+def _get_current_traceback(skip_frames = 0) -> Optional[types.TracebackType]:
+  tb = None
+  depth = 0
+  import inspect
+  for frame_info in inspect.stack():
+    frame = frame_info.frame
+    if skip_frames:
+      skip_frames -= 1
+    elif not traceback_util.include_frame(frame):
+      continue
+    else:
+      tb = types.TracebackType(tb, frame, frame.f_lasti, frame.f_lineno)
+  return tb
+
+def summary() -> Optional[types.TracebackType]:
+  return _get_current_traceback()
 
 def nan_error_check(prim, error, enabled_errors, *in_vals, **params):
   out = prim.bind(*in_vals, **params)

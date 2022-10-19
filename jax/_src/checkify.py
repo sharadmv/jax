@@ -105,10 +105,15 @@ class JaxError(Exception, metaclass=abc.ABCMeta):
   def get_effect_type(self) -> core.Effect:
     pass
 
+@functools.total_ordering
 @dataclass(frozen=True)
 class ErrorEffect:
   error_type: Type[JaxError]
   shape_dtypes: Tuple[Any]
+
+  def __lt__(self, other):
+    return (id(self.error_type) < id(other.error_type) and 
+            self.shape_dtypes < other.shape_dtypes)
 
 @register_pytree_node_class
 class DivideByZero(JaxError):

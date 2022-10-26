@@ -979,7 +979,7 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts, num_carry
       var = jaxpr.jaxpr.outvars[num_consts + j]
       for eff in prev_effects | affine_effects:
         if eff.key_aval is var.aval:
-          output_effects.add(ConsumedKey(var.aval))
+          output_effects.add(type(eff)(var.aval))
     input_effects = {
         ConsumedKey(invar.aval) for invar, outvar
         in zip(jaxpr.jaxpr.invars, jaxpr.jaxpr.outvars)

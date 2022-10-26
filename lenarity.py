@@ -37,7 +37,8 @@ try:
   jaxpr = jax.make_jaxpr(f)(random.PRNGKey(0)).jaxpr
   core.check_jaxpr(jaxpr)
 except core.JaxprTypeError:
-  traceback.print_exc()
+  pass
+  # traceback.print_exc()
 else:
   print("UH OH!")
 

@@ -973,17 +973,20 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts, num_carry
     effs = affine_effects & prev_effects
     if effs:
       raise core.JaxprTypeError(f"Affine effects duplicated in scan: {effs}")
-    from jax._src.prng import ConsumedKey
     output_effects = set()
+    output_map = {}
     for j in range(num_carry):
       var = jaxpr.jaxpr.outvars[num_consts + j]
       for eff in prev_effects | affine_effects:
         if eff.key_aval is var.aval:
-          output_effects.add(type(eff)(var.aval))
+          eff = type(eff)(var.aval)
+          output_effects.add(eff)
+          output_map[var] = eff
     input_effects = {
-        ConsumedKey(invar.aval) for invar, outvar
-        in zip(jaxpr.jaxpr.invars, jaxpr.jaxpr.outvars)
-        if any(outvar.aval is eff.key_aval for eff in output_effects)}
+        type(output_map[outvar])(invar.aval) for invar, outvar in
+        zip(jaxpr.jaxpr.invars, jaxpr.jaxpr.outvars)
+        if outvar in output_map}
+        
     prev_effects |= input_effects
   return [*init_avals, *y_avals], jaxpr.effects
 

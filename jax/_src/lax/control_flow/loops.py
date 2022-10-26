@@ -968,8 +968,6 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts, num_carry
 
   affine_effects = {eff for eff in jaxpr.effects if eff in core.affine_effects}
 
-  if any(jaxpr.effects[eff] > 1 for eff in core.affine_effects):
-    raise core.JaxprTypeError("Affine effects happens more than one time.")
   prev_effects = set()
   for _ in range(length):
     effs = affine_effects & prev_effects

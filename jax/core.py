@@ -2611,7 +2611,19 @@ def _check_call(ctx_factory, prim, in_atoms, params):
                            f"{substitute(v.aval)}")
     env[v] = x if type(x) is Var else x.val
 
-  _check_jaxpr(ctx_factory, call_jaxpr)
+  try:
+    _check_jaxpr(ctx_factory, call_jaxpr)
+  except JaxprTypeError as e:
+    ctx, pp_settings = ctx_factory()
+    if len(e.args) == 2:
+      msg, eqnidx = e.args
+      jaxpr_str = str(pp_jaxpr_eqn_range(call_jaxpr, eqnidx - 10, eqnidx + 10,
+                                         ctx, pp_settings))
+    else:
+      msg, = e.args
+      jaxpr_str = str(pp_jaxpr_eqn_range(call_jaxpr, 0, 20, ctx, pp_settings))
+    msg = "\n\n".join([msg, "while checking call jaxpr:", jaxpr_str])
+    raise JaxprTypeError(msg) from None
 
   invars, outvars = call_jaxpr.invars, call_jaxpr.outvars
   in_map : Dict[Var,  InDBIdx] = {v:  InDBIdx(i) for i, v in enumerate( invars)}

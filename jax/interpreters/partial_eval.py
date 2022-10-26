@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections
 from collections import namedtuple
 import contextlib
 import functools
@@ -218,6 +219,8 @@ class JaxprTrace(Trace):
     tracers = map(self.instantiate_const, tracers)
     avals = [t.aval for t in tracers]
     out_aval, effects = primitive.abstract_eval(*avals, **params)
+    if isinstance(effects, set):
+      effects = collections.Counter({eff: 1 for eff in effects})
     name_stack = self._current_truncated_name_stack()
     source = source_info_util.current().replace(name_stack=name_stack)
     if primitive.multiple_results:
@@ -1515,15 +1518,12 @@ class JaxprStackFrame:
     self.tracers = []   # circ refs, frame->tracer->trace->main->frame,
     self.eqns = []      # cleared when we pop frame from main
     self.invars = []
-    self.effects = set()
+    self.effects = collections.Counter()
     self.debug_info = None
 
   def add_eqn(self, eqn: core.JaxprEqn):
     self.eqns.append(eqn)
-    for eff in eqn.effects:
-      if eff in core.affine_effects and eff in self.effects:
-        raise ValueError(f"Affine effect added twice: {eff}")
-    self.effects |= eqn.effects
+    self.effects.update(eqn.effects)
 
   def to_jaxpr(self, out_tracers):
     # It's not necessary, but we keep the tracer-to-var mapping injective:
@@ -1722,6 +1722,8 @@ class DynamicJaxprTrace(core.Trace):
   def default_process_primitive(self, primitive, tracers, params):
     avals = [t.aval for t in tracers]
     out_avals, effects = primitive.abstract_eval(*avals, **params)
+    if isinstance(effects, set):
+      effects = collections.Counter({eff: 1 for eff in effects})
     out_avals = [out_avals] if not primitive.multiple_results else out_avals
     source_info = source_info_util.current()
     out_tracers = [DynamicJaxprTracer(self, a, source_info) for a in out_avals]

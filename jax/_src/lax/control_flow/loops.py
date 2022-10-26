@@ -265,7 +265,7 @@ def scan(f: Callable[[Carry, X], Tuple[Carry, Y]],
                         # Extract the subtree and avals for the first element of the return tuple
                         out_tree_children[0], carry_avals_out,
                         init_tree, carry_avals)
-  disallowed_effects = jaxpr.effects - allowed_effects
+  disallowed_effects = set(jaxpr.effects) - allowed_effects
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `scan`: {disallowed_effects}')
@@ -965,6 +965,28 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts, num_carry
     raise core.JaxprTypeError(
       f'scan jaxpr takes input sequence types\n{_avals_short(x_avals_jaxpr)},\n'
       f'called with sequence of type\n{_avals_short(x_avals)}')
+
+  affine_effects = {eff for eff in jaxpr.effects if eff in core.affine_effects}
+
+  if any(jaxpr.effects[eff] > 1 for eff in core.affine_effects):
+    raise core.JaxprTypeError("Affine effects happens more than one time.")
+  prev_effects = set()
+  for _ in range(length):
+    effs = affine_effects & prev_effects
+    if effs:
+      raise core.JaxprTypeError(f"Affine effects duplicated in scan: {effs}")
+    from jax._src.prng import ConsumedKey
+    output_effects = set()
+    for j in range(num_carry):
+      var = jaxpr.jaxpr.outvars[num_consts + j]
+      for eff in prev_effects | affine_effects:
+        if eff.key_aval is var.aval:
+          output_effects.add(ConsumedKey(var.aval))
+    input_effects = {
+        ConsumedKey(invar.aval) for invar, outvar
+        in zip(jaxpr.jaxpr.invars, jaxpr.jaxpr.outvars)
+        if any(outvar.aval is eff.key_aval for eff in output_effects)}
+    prev_effects |= input_effects
   return [*init_avals, *y_avals], jaxpr.effects
 
 def _scan_pp_rule(eqn, context, settings):
@@ -1119,7 +1141,7 @@ def while_loop(cond_fun: Callable[[T], BooleanNumeric],
                         body_tree, body_jaxpr.out_avals,
                         in_tree_children[0], init_avals)
   effects = core.join_effects(cond_jaxpr.effects, body_jaxpr.effects)
-  disallowed_effects = effects - allowed_effects
+  disallowed_effects = set(effects) - allowed_effects
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {disallowed_effects}')
@@ -1131,7 +1153,7 @@ def while_loop(cond_fun: Callable[[T], BooleanNumeric],
 def _while_loop_abstract_eval(*args, cond_jaxpr, body_jaxpr, **kwargs):
   del args, kwargs
   joined_effects = core.join_effects(cond_jaxpr.effects, body_jaxpr.effects)
-  disallowed_effects = joined_effects - allowed_effects
+  disallowed_effects = set(joined_effects) - allowed_effects
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {disallowed_effects}')
@@ -1543,7 +1565,7 @@ def _while_typecheck(*in_atoms, cond_jaxpr, body_jaxpr, cond_nconsts,
                      body_nconsts):
   # TODO(frostig,mattjj): check cond_jaxpr, body_jaxpr types
   joined_effects = core.join_effects(cond_jaxpr.effects, body_jaxpr.effects)
-  if joined_effects - allowed_effects:
+  if set(joined_effects) - allowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {joined_effects - allowed_effects}')
   return body_jaxpr.out_avals, joined_effects

@@ -60,8 +60,8 @@ map, unsafe_map = safe_map, map
 # -------------------- jaxprs --------------------
 
 Effect = Hashable
-Effects = Set[Effect]
-no_effects: Effects = set()
+Effects = collections.Counter[Effect]
+no_effects: Effects = collections.Counter()
 ordered_effects: Set[Effect] = set()
 affine_effects: Set[Effect] = set()
 
@@ -71,11 +71,11 @@ class Jaxpr:
   invars: List[Var]
   outvars: List[Atom]
   eqns: List[JaxprEqn]
-  effects: Effects
+  effects: collections.Counter[Effect]
 
   def __init__(self, constvars: Sequence[Var], invars: Sequence[Var],
                outvars: Sequence[Atom], eqns: Sequence[JaxprEqn],
-               effects: Effects = no_effects):
+               effects: collections.Counter[Effect] = no_effects):
     """
     Args:
       constvars: list of variables introduced for constants. Array constants are
@@ -92,6 +92,7 @@ class Jaxpr:
     self.outvars = list(outvars)
     self.eqns = list(eqns)
     self.effects = effects
+    assert isinstance(self.effects, collections.Counter)
 
   def __str__(self):
     return str(pp_jaxpr(self, JaxprPpContext(), JaxprPpSettings()))
@@ -120,7 +121,7 @@ class Jaxpr:
                  effects=effects)
 
 def join_effects(*effects: Effects) -> Effects:
-  return set.union(*effects) if effects else no_effects
+  return functools.reduce(lambda a, b: a + b, effects)
 
 def jaxprs_in_params(params) -> Iterator[Jaxpr]:
   for val in params.values():
@@ -2427,6 +2428,8 @@ def _check_jaxpr(
     ctx_factory: Callable[[], Tuple[JaxprPpContext, JaxprPpSettings]],
     jaxpr: Jaxpr
   ) -> None:
+  if any(jaxpr.effects[eff] > 1 for eff in affine_effects):
+    raise JaxprTypeError("Affine effects happens more than one time.")
   # Use set of variables to types to check that variables are in scope.
   env: Set[Var] = set()
 
@@ -2489,14 +2492,19 @@ def _check_jaxpr(
         out_type, effects = _check_map(ctx_factory, prim, in_avals, eqn.params)
       else:
         out_type, effects = check_eqn(prim, in_avals, eqn.params)
+      if isinstance(effects, set):
+        effects = collections.Counter(effects)
 
       # Check the computed effect type matches the eqn's annotation, and is
       # included in the jaxpr's annotation.
+      if not isinstance(effects, collections.Counter):
+        breakpoint()
       if eqn.effects != effects:
         raise JaxprTypeError("Inferred effects do not match equation effects. "
                              f"Equation effects: {eqn.effects}. "
                              f"Jaxpr effects: {effects}")
-      if not eqn.effects.issubset(jaxpr.effects):
+      if jaxpr.effects and eqn.effects - jaxpr.effects:
+        breakpoint()
         raise JaxprTypeError("Equation effects are not subset of Jaxpr effects. "
                              f"Equation effects: {eqn.effects}. "
                              f"Jaxpr effects: {jaxpr.effects}")
@@ -2572,6 +2580,8 @@ def check_eqn(prim, in_avals, params):
     check_jaxpr(jaxpr)
 
   out_avals, effects = prim.abstract_eval(*in_avals, **params)
+  if not isinstance(effects, set):
+    effects = collections.Counter({eff: 1 for eff in effects})
   if not prim.multiple_results:
     out_avals = [out_avals]
   return out_avals, effects

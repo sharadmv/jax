@@ -588,6 +588,9 @@ class ConsumedKey:
 
   def __post_init__(self):
     core.affine_effects.add(self)
+    from jax._src.lax import control_flow
+    control_flow.allowed_effects.add(self)
+    mlir.lowerable_effects.add(self)
 
   def __hash__(self):
     return object.__hash__(self.key_aval)
@@ -596,7 +599,7 @@ class ConsumedKey:
     return other.key_aval is self.key_aval
 
   def __repr__(self):
-    return f"ConsumedKey<{id(self.key_aval) % 29}>"
+    return f"Consumed<{id(self.key_aval) % 29}>"
 
 
 def random_seed(seeds, impl):

@@ -63,6 +63,7 @@ Effect = Hashable
 Effects = Set[Effect]
 no_effects: Effects = set()
 ordered_effects: Set[Effect] = set()
+affine_effects: Set[Effect] = set()
 
 
 class Jaxpr:

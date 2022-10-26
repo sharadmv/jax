@@ -1520,6 +1520,9 @@ class JaxprStackFrame:
 
   def add_eqn(self, eqn: core.JaxprEqn):
     self.eqns.append(eqn)
+    for eff in eqn.effects:
+      if eff in core.affine_effects and eff in self.effects:
+        raise ValueError(f"Affine effect added twice: {eff}")
     self.effects |= eqn.effects
 
   def to_jaxpr(self, out_tracers):

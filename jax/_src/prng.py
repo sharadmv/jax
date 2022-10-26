@@ -14,6 +14,7 @@
 
 
 import abc
+import dataclasses
 from functools import partial
 import operator as op
 from typing import Any, Callable, Hashable, Iterator, NamedTuple, Sequence
@@ -581,6 +582,22 @@ def iterated_vmap_binary_bcast(shape1, shape2, f):
       f = squeeze_vmap(f, sz1 == 1)
   return f
 
+@dataclasses.dataclass
+class ConsumedKey:
+  key_aval: core.AbstractValue
+
+  def __post_init__(self):
+    core.affine_effects.add(self)
+
+  def __hash__(self):
+    return object.__hash__(self.key_aval)
+
+  def __eq__(self, other):
+    return other.key_aval is self.key_aval
+
+  def __repr__(self):
+    return f"ConsumedKey<{id(self.key_aval) % 29}>"
+
 
 def random_seed(seeds, impl):
   # Avoid overflow error in X32 mode by first converting ints to int64.
@@ -627,9 +644,10 @@ random_split_p = core.Primitive('random_split')
 ad.defjvp_zero(random_split_p)
 batching.defvectorized(random_split_p)
 
-@random_split_p.def_abstract_eval
+@random_split_p.def_effectful_abstract_eval
 def random_split_abstract_eval(keys_aval, *, count):
-  return keys_shaped_array(keys_aval.dtype.impl, (*keys_aval.shape, count))
+  return (keys_shaped_array(keys_aval.dtype.impl, (*keys_aval.shape, count)),
+          {ConsumedKey(keys_aval)})
 
 @random_split_p.def_impl
 def random_split_impl(keys, *, count):
@@ -661,12 +679,13 @@ random_fold_in_p = core.Primitive('random_fold_in')
 ad.defjvp_zero(random_fold_in_p)
 batching.defbroadcasting(random_fold_in_p)
 
-@random_fold_in_p.def_abstract_eval
+@random_fold_in_p.def_effectful_abstract_eval
 def random_fold_in_abstract_eval(keys_aval, msgs_aval):
   shape = lax_internal.broadcasting_shape_rule(
       'random_fold_in', keys_aval, msgs_aval)
   named_shape = lax_utils.standard_named_shape_rule(keys_aval, msgs_aval)
-  return core.ShapedArray(shape, keys_aval.dtype, named_shape=named_shape)
+  return (core.ShapedArray(shape, keys_aval.dtype, named_shape=named_shape),
+          {ConsumedKey(keys_aval)})
 
 @random_fold_in_p.def_impl
 def random_fold_in_impl(keys, msgs):
@@ -712,11 +731,11 @@ random_bits_p = core.Primitive('random_bits')
 ad.defjvp_zero(random_bits_p)
 batching.defvectorized(random_bits_p)
 
-@random_bits_p.def_abstract_eval
+@random_bits_p.def_effectful_abstract_eval
 def random_bits_abstract_eval(keys_aval, *, bit_width, shape):
   out_shape = (*keys_aval.shape, *shape)
   out_dtype = dtypes.dtype(f'uint{bit_width}')
-  return core.ShapedArray(out_shape, out_dtype)
+  return core.ShapedArray(out_shape, out_dtype), {ConsumedKey(keys_aval)}
 
 @random_bits_p.def_impl
 def random_bits_impl(keys, *, bit_width, shape):

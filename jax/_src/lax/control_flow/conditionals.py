@@ -745,6 +745,8 @@ def _cond_typecheck(*in_atoms, branches, linear):
       f'cond branches must have matching effect types: '
       f'{[b.effects for b in branches]}')
   joined_effects = core.join_effects(*(b.effects for b in branches))
+  joined_affine_effects = {eff for eff in joined_effects if eff in
+                           core.affine_effects}
   return jaxpr0.out_avals, joined_effects
 
 def cond_bind(*args, branches, linear):

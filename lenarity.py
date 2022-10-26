@@ -16,6 +16,19 @@ jaxpr = jax.make_jaxpr(f)(random.PRNGKey(0)).jaxpr
 core.check_jaxpr(jaxpr)
 
 def f(key):
+  return random.normal(key) + random.normal(key)
+
+try:
+  jaxpr = jax.make_jaxpr(f)(random.PRNGKey(0)).jaxpr
+  core.check_jaxpr(jaxpr)
+except core.JaxprTypeError:
+  pass
+  # traceback.print_exc()
+else:
+  print("UH OH!")
+
+
+def f(key):
   def body(key, x):
     key, subkey = random.split(key)
     x = x + random.normal(subkey)
@@ -60,3 +73,35 @@ except:
   pass
 else:
   print("UH OH!")
+
+def f(key, x):
+  def body(carry):
+    k1, k2, k3, x, i = carry
+    x = x + random.normal(k1)
+    return [k3, k1, k2, x, i + 1]
+  k1, k2, k3 = random.split(key, 3)
+  def cond(carry):
+    return carry[-1] < 5
+  return lax.while_loop(cond, body, [k1, k2, k3, x, 0])
+
+try:
+  jaxpr = jax.make_jaxpr(f)(random.PRNGKey(0), jnp.arange(4.)).jaxpr
+  core.check_jaxpr(jaxpr)
+except:
+  pass
+else:
+  print("UH OH!")
+
+def f(key, x):
+  def body(carry):
+    k1, k2, k3, x, i = carry
+    return [k3, k1, k2, x, i + 1]
+  k1, k2, k3 = random.split(key, 3)
+  def cond(carry):
+    k1, k2, k3, x, i = carry
+    # Effect in cond
+    return jnp.logical_and(i < 5, random.normal(k1) < 4)
+  return lax.while_loop(cond, body, [k1, k2, k3, x, 0])
+
+jaxpr = jax.make_jaxpr(f)(random.PRNGKey(0), jnp.arange(4.)).jaxpr
+core.check_jaxpr(jaxpr)

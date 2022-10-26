@@ -967,7 +967,6 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts, num_carry
       f'called with sequence of type\n{_avals_short(x_avals)}')
 
   affine_effects = {eff for eff in jaxpr.effects if eff in core.affine_effects}
-
   prev_effects = set()
   for _ in range(length):
     effs = affine_effects & prev_effects
@@ -1569,7 +1568,34 @@ def _while_typecheck(*in_atoms, cond_jaxpr, body_jaxpr, cond_nconsts,
   if set(joined_effects) - allowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `while`: {joined_effects - allowed_effects}')
-  return body_jaxpr.out_avals, joined_effects
+  body_affine_effects = {eff for eff in body_jaxpr.effects if eff
+                         in core.affine_effects}
+  cond_affine_effects = {eff for eff in cond_jaxpr.effects if eff
+                         in core.affine_effects}
+  affine_effects = body_affine_effects | cond_affine_effects
+  prev_effects = set()
+  while True:
+    effs = affine_effects & prev_effects
+    if effs:
+      raise core.JaxprTypeError(f"Affine effects duplicated in while: {effs}")
+    output_effects = set()
+    output_map = {}
+    for j in range(len(in_atoms) - body_nconsts):
+      var = body_jaxpr.jaxpr.outvars[body_nconsts + j]
+      for eff in prev_effects | affine_effects:
+        if eff.key_aval is var.aval:
+          eff = type(eff)(var.aval)
+          output_effects.add(eff)
+          output_map[var] = eff
+    input_effects = {
+        type(output_map[outvar])(invar.aval) for invar, outvar in
+        zip(body_jaxpr.jaxpr.invars, body_jaxpr.jaxpr.outvars)
+        if outvar in output_map}
+    old_prev_effects = set(prev_effects)
+    prev_effects |= input_effects
+    if old_prev_effects == prev_effects:
+      break
+  return body_jaxpr.out_avals, joined_effects | {eff: 1 for eff in prev_effects}
 
 while_p = core.AxisPrimitive('while')
 while_p.multiple_results = True

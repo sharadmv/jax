@@ -2497,14 +2497,11 @@ def _check_jaxpr(
 
       # Check the computed effect type matches the eqn's annotation, and is
       # included in the jaxpr's annotation.
-      if not isinstance(effects, collections.Counter):
-        breakpoint()
       if eqn.effects != effects:
         raise JaxprTypeError("Inferred effects do not match equation effects. "
                              f"Equation effects: {eqn.effects}. "
                              f"Jaxpr effects: {effects}")
       if jaxpr.effects and eqn.effects - jaxpr.effects:
-        breakpoint()
         raise JaxprTypeError("Equation effects are not subset of Jaxpr effects. "
                              f"Equation effects: {eqn.effects}. "
                              f"Jaxpr effects: {jaxpr.effects}")

@@ -381,7 +381,9 @@ def _partial_eval_jaxpr_custom(jaxpr, in_unknowns, policy):
 _save_everything = lambda *_, **__: True
 
 def _is_read_only(ref_effects: Set[StateEffect]) -> bool:
-  assert len(ref_effects) > 0
+  if not ref_effects:
+    return True
+  # assert len(ref_effects) > 0
   if len(ref_effects) > 1:
     # Means we must have a write or accum effect so not read-only
     return False
@@ -446,9 +448,16 @@ def _for_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
 
   # We use `partial_eval_jaxpr_custom` here because it won't remove effectful
   # primitives like `get`/`set`.
+  ref_effects = _get_ref_state_effects(jaxpr)[1:]
+  read_only_avals = {v.aval for v, eff in zip(jaxpr.invars[1:], ref_effects)
+                     if _is_read_only(eff)}
+  def _remat_read_only_refs(prim, *avals, **params):
+    if prim is not state.get_p:
+      return True
+    return avals[0] not in read_only_avals
   jaxpr_known_resout, jaxpr_unknown_resin_, uk_out, inst_out, num_res = \
         _partial_eval_jaxpr_custom(jaxpr, [False, *in_unknowns],
-                                   _save_everything)
+                                   _remat_read_only_refs)
   # # `partial_eval_jaxpr_custom` will give us jaxprs that have hybrid `Ref` and
   # regular valued input/outputs. However, we'd like to bind these jaxprs to a
   # `for`, which expects only `Ref` inputs and no output. We need to convert
@@ -507,7 +516,8 @@ def _for_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
              in zip(tracers, used_and_known)]
   _, known_used = partition_list(used_refs, used_and_known)
   _, used_tracers = partition_list(used_refs, tracers)
-  _, used_which_linear = partition_list(used_refs, which_linear)
+  which_linear_ = map(operator.and_, in_unknowns, which_linear)
+  _, used_which_linear = partition_list(used_refs, which_linear_)
   which_linear_unknown = (False,) * num_res + tuple(used_which_linear)
   unknown_inputs = [*residuals, *used_tracers]
   # Outputs match inputs so we construct output tracers that look like the input
@@ -731,30 +741,26 @@ def _for_transpose(in_cts, *args, jaxpr, nsteps, reverse, which_linear, unroll):
   # for res stuff:
   #                          (zero ct   , not UndefinedPrimal)
   args_ = []
-  which_linear_transpose = []
   for x, ct in zip(args, in_cts):
     if   type(ct) is     ad_util.Zero and not ad.is_undefined_primal(x):
       # this is a residual, take x!
       args_.append(x)
-      which_linear_transpose.append(False)
     elif type(ct) is     ad_util.Zero and     ad.is_undefined_primal(x):
       # the loop was 'just getting', plug in a zero
       args_.append(ad_util.zeros_like_aval(x.aval))
-      which_linear_transpose.append(False)
     elif type(ct) is not ad_util.Zero and not ad.is_undefined_primal(x):
       # the loop was 'just setting', grab that cotangent! x is dummy
       args_.append(ct)
-      which_linear_transpose.append(False)
     elif type(ct) is not ad_util.Zero and     ad.is_undefined_primal(x):
       # the loop was 'getting and setting', grab that cotangent!
       args_.append(ct)
-      which_linear_transpose.append(True)
 
   jaxpr_transpose = transpose_jaxpr(jaxpr, which_linear)
+  # breakpoint()
   assert len(args_) == len(jaxpr_transpose.invars) - 1
   all_outs = for_p.bind(*args_, jaxpr=jaxpr_transpose, nsteps=nsteps,
                         reverse=not reverse,
-                        which_linear=tuple(which_linear_transpose),
+                        which_linear=tuple(which_linear),
                         unroll=unroll)
   ct_outs = [ct if ad.is_undefined_primal(x) else None
              for x, ct in zip(args, all_outs)]

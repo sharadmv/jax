@@ -185,10 +185,9 @@ def accum_ref(x, accum):
 def for_body_sin_sq(i, refs):
   x_ref, y_ref = refs
   x = x_ref[i]
-  y = x
-  y_ref[i] = y
-  y = y_ref[i]
-  y_ref[i] = jnp.sin(y * y)
+  # y_ref[i] = x
+  # y = y_ref[i]
+  y_ref[i] = jnp.sin(x * x)
 
 sin_sq_ref = lambda x, y: (x, jnp.sin(x * x))
 
@@ -400,6 +399,21 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     ref = lambda x: jax.vmap(jax.vmap(jax.vmap(func)))(x).sum()
     self.assertAllClose(f(x), ref(x))
     jtu.check_grads(f, (x,), order=2, atol=0.1, rtol=0.1)
+
+  def test_for_vjp_forwards_extensive_residuals(self):
+    # https://github.com/google/jax/issues/4510
+    def cumprod(x):
+      s = jnp.ones((2, 32), jnp.float32)
+      def body(i, refs):
+        carry_ref, x_ref, o_ref = refs
+        c = carry_ref[()]
+        o_ref[i] = c
+        carry_ref[()] = c * x_ref[i]
+      return for_loop.for_loop(x.shape[0], body, (s, x, jnp.zeros_like(x)))
+
+    rng = self.rng()
+    x = jnp.asarray(rng.randn(32, 2, 32).astype('float32'))
+    print(jax.make_jaxpr(lambda x: jax.linearize(cumprod, x)[0])(x))
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

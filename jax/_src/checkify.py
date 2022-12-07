@@ -1086,26 +1086,36 @@ def cond_error_check(error: Error, enabled_errors, index, *ops, branches, linear
   effects = [get_error_effects_from_jaxpr(jxpr, enabled_errors, error, *ops)
              for jxpr in branches]
   merged_error = error._add_placeholder_effects(set().union(*effects))
+  err_vals, err_tree = jtu.tree_flatten(merged_error)
 
   checked_branch_funs = tuple(
-      functools.partial(checkify_jaxpr_flat, closed_jaxpr.jaxpr, closed_jaxpr.consts, enabled_errors)
+      functools.partial(checkify_jaxpr_flat, closed_jaxpr.jaxpr, closed_jaxpr.consts, enabled_errors, err_tree)
       for closed_jaxpr in branches)
-  in_vals, in_tree = jtu.tree_flatten((error, ops))
+  checked_branch_funs = map(lu.wrap_init, checked_branch_funs)
+  checked_branch_funs, out_trees = unzip2(map(_flatten_and_get_error_metadata_thunk, checked_branch_funs))
+  in_vals, in_tree = jtu.tree_flatten((merged_error, ops))
   get_shaped_aval = lambda x: core.raise_to_shaped(core.get_aval(x))
   in_avals = tuple(map(get_shaped_aval, in_vals))
-  # TODO: we need a fun to jaxpr here but don't know which one.
 
-  err_vals, err_tree = jtu.tree_flatten(merged_error)
+  def to_jaxpr(fun, in_avals):
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(fun, in_avals)
+    return core.ClosedJaxpr(jaxpr, consts)
+
+  new_branches = map(
+      lambda fun: to_jaxpr(fun, in_avals),
+      checked_branch_funs)
+
   new_linear = (*[False] * len(err_vals), *linear)
   err_and_outs = lax.cond_p.bind(
-      index, *ops,
+      index, *err_vals, *ops,
       branches=tuple(new_branches), linear=new_linear)
 
   # we need to merge metadata across out_trees (a tuple)
-  err0, *out = tree_unflatten(out_trees[0], err_and_outs)
+  out_trees = map(lambda fun: fun(), out_trees)
+  out, err0 = tree_unflatten(out_trees[0], err_and_outs)
   merged_metadata = err0._metadata
   for tr in out_trees[1:]:
-    err, *_ = tree_unflatten(tr, err_and_outs)
+    _, err = tree_unflatten(tr, err_and_outs)
     merged_metadata = {**merged_metadata, **err._metadata}
   return out, err0._replace(_metadata=merged_metadata)
 error_checks[lax.cond_p] = cond_error_check

@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import itertools as it
 import types
-from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable, Type, Set, List, Sequence
+from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable, Type, Set, List, Sequence, Any
 
 import jax
 from jax import core
@@ -56,6 +56,7 @@ Int = Union[int, Array]
 ErrorCategory = Type['JaxException']
 Payload = List[Union[np.ndarray, Array]]
 PyTreeDef = jtu.PyTreeDef
+Out = TypeVar('Out')
 
 ## Utils
 
@@ -292,6 +293,9 @@ class Error:
   def _replace(self, *args, **kwargs):
     return dataclasses.replace(self, *args, **kwargs)
 
+  def _get_effects(self):
+    return self._pred.keys()
+
   # PyTree methods
 
   def tree_flatten(self):
@@ -325,169 +329,276 @@ def update_error(error, pred, code, metadata, payload, effect_type):
 
 ## Checkify transformation for plumbing functional error values.
 
-class CheckifyTracer(core.Tracer):
-  def __init__(self, trace, val):
-    self._trace = trace
-    self.val = val
-  aval = property(lambda self: core.get_aval(self.val))
-  full_lower = lambda self: self
+@lu.transformation_with_aux
+def _flatten_and_get_error_metadata_thunk(*invals):
+  out, error = yield invals, {}
+  out_vals, out_tree = jtu.tree_flatten((out, error))
+  yield out_vals, out_tree
 
-class CheckifyTrace(core.Trace):
-  pure = lift = lambda self, val: CheckifyTracer(self, val)
+@lu.transformation_with_aux
+def _query_error_effects(*args):
+  out, error = yield args, {}
+  yield out, set(error._pred.keys())
 
-  def __init__(self, main: core.MainTrace, sublevel: core.Sublevel,
-               enabled_errors: FrozenSet['ErrorCategory']) -> None:
-    self.main = main
-    self.level = main.level
-    self.sublevel = sublevel
-    self.main.enabled_errors = enabled_errors
+def get_error_effects_from_jaxpr(closed_jaxpr: core.ClosedJaxpr,
+                                 enabled_errors,
+                                 error,
+                                 *args) -> Set[ErrorEffect]:
+  """Probes a jaxpr for its error effects."""
+  err_vals, err_tree = jtu.tree_flatten(error)
+  checkify_fun = lu.wrap_init(
+      functools.partial(checkify_jaxpr_flat, closed_jaxpr.jaxpr,
+                        closed_jaxpr.literals, enabled_errors, err_tree))
+  checkify_fun, error_effects = _query_error_effects(checkify_fun)
+  get_shaped_aval = lambda x: core.raise_to_shaped(core.get_aval(x))
+  in_avals = map(get_shaped_aval, [*err_vals, *args])
+  pe.trace_to_jaxpr_final(checkify_fun, in_avals)
+  return error_effects()
 
-  def sublift(self, tracer):
-    return CheckifyTracer(self, tracer.val)
 
-  def process_primitive(self, primitive, tracers, params):
-    in_vals = [t.val for t in tracers]
-    rule = error_checks.get(primitive)
-    if rule:
-      out, self.main.error = rule(self.main.error, self.main.enabled_errors,  # type: ignore
-                                  *in_vals, **params)
+def default_checkify_rule(primitive: core.Primitive, error: Error,
+                          enabled_errors, *invals: core.Value,
+                          **params: Any) -> Tuple[Sequence[core.Value], Error]:
+  """Default rule for primitives in `checkify` interpreter."""
+  if 'call_jaxpr' not in params:
+    # Default primitive case: call primitive and don't update error.
+    return primitive.bind(*invals, **params), error
+
+  call_jaxpr = params.pop('call_jaxpr')
+  err_vals, err_tree = jtu.tree_flatten(error)
+  partial_checkify = lu.wrap_init(
+      functools.partial(checkify_jaxpr_flat, call_jaxpr, (), enabled_errors))
+  partial_checkify, out_tree = _flatten_and_get_error_metadata_thunk(
+      partial_checkify, err_tree)
+  if 'donated_invars' in params:
+    params = dict(params, donated_invars=(*[False]*len(err_vals),
+                                          *params['donated_invars']))
+
+  all_vals = primitive.bind(partial_checkify, *err_vals, *invals, **params)
+
+  # __import__('pdb').set_trace()
+  out_vals, error = tree_unflatten(out_tree(), all_vals)
+  return out_vals, error
+
+# def jaxpr_to_checkify_jaxpr(
+#     jaxpr: core.ClosedJaxpr, error,
+#     enabled_errors) -> Tuple[core.ClosedJaxpr, FrozenSet[ErrorEffect]]:
+#   f = lu.wrap_init(core.jaxpr_as_fun(jaxpr))
+#   return checkify_fun_to_jaxpr(f, error, enabled_errors, jaxpr.in_avals)
+
+# def checkify_fun_to_jaxpr(
+#     f, error, enabled_errors,
+#     in_avals) -> Tuple[core.ClosedJaxpr, Tuple[PyTreeDef, FrozenSet[ErrorEffect]]]:
+#   flat_error_vals, in_tree = tree_flatten(error)
+#   in_tree = jtu.tree_structure((error, *in_avals))
+#   f, out_tree = flatten_fun_nokwargs(f, in_tree)
+#   err_vals = map(lambda x: core.raise_to_shaped(core.get_aval(x)),
+#                  flat_error_vals)
+#   avals_in = [*err_vals, *in_avals]
+#   jaxpr_out, _, literals_out = pe.trace_to_jaxpr_dynamic(f, avals_in)
+#   return core.ClosedJaxpr(jaxpr_out, literals_out), out_tree()
+
+def checkify_jaxpr(jaxpr: core.ClosedJaxpr, enabled_errors,
+                   error: Error, *args):
+  err_vals, err_tree = jtu.tree_flatten(error)
+  return checkify_jaxpr_flat(jaxpr.jaxpr, jaxpr.consts,
+                             enabled_errors, err_tree, *err_vals, *args)
+
+def checkify_jaxpr_flat(jaxpr: core.Jaxpr, consts: Sequence[core.Value],
+                        enabled_errors, err_tree: PyTreeDef,
+                        *args: core.Value) -> Tuple[Out, Error, Set[ErrorEffect]]:
+  env = {}
+  err_vals, args = split_list(args, [err_tree.num_leaves])
+  error = jtu.tree_unflatten(err_tree, err_vals)
+
+  def read_env(var: core.Var):
+    if isinstance(var, core.Literal):
+      return var.val
+    return env[var]
+
+  def write_env(var, val):
+    assert not isinstance(val, Sequence)
+    assert not isinstance(val, Error)
+    env[var] = val
+  map(write_env, jaxpr.constvars, consts)
+  map(write_env, jaxpr.invars, args)
+
+  # interpreter loop
+  for eqn in jaxpr.eqns:
+    invals = map(read_env, eqn.invars)
+    checkify_rule = error_checks.get(
+        eqn.primitive, functools.partial(default_checkify_rule, eqn.primitive))
+    outvals, error = checkify_rule(error, enabled_errors, *invals, **eqn.params)
+    if eqn.primitive.multiple_results:
+      map(write_env, eqn.outvars, outvals)
     else:
-      out = primitive.bind(*in_vals, **params)
-    if primitive.multiple_results:
-      return [CheckifyTracer(self, x) for x in out]
-    else:
-      return CheckifyTracer(self, out)
+      write_env(eqn.outvars[0], outvals)
 
-  def process_call(self, primitive, f, tracers, params):
-    in_vals = [t.val for t in tracers]
-    e = popattr(self.main, 'error')
-    flat_vals, in_tree = tree_flatten((e, *in_vals))
-    f = checkify_subtrace(f, self.main)
-    f, out_tree = flatten_fun_nokwargs(f, in_tree)
-    if 'donated_invars' in params:
-      params = dict(params, donated_invars=(*[False]*len(jtu.tree_leaves(e)),
-                                            *params['donated_invars']))
-    all_vals = primitive.bind(f, *flat_vals, **params)
-    error, *out_vals = tree_unflatten(out_tree(), all_vals)
-    setnewattr(self.main, 'error', error)
-    return [CheckifyTracer(self, x) for x in out_vals]
+  return map(read_env, jaxpr.outvars), error
 
-  def process_map(self, primitive, f, tracers, params):
-    in_vals = [t.val for t in tracers]
-    e = popattr(self.main, 'error')
-    flat_vals, in_tree = tree_flatten((e, *in_vals))
-    num_error_vals = len(jtu.tree_leaves(e))
-    f = checkify_subtrace(f, self.main)
-    f, out_tree = flatten_fun_nokwargs(f, in_tree)
+# class CheckifyTracer(core.Tracer):
+#   def __init__(self, trace, val):
+#     self._trace = trace
+#     self.val = val
+#   aval = property(lambda self: core.get_aval(self.val))
+#   full_lower = lambda self: self
 
-    @as_hashable_function(closure=params['out_axes_thunk'])
-    def new_out_axes_thunk():
-      out_val_axes = params['out_axes_thunk']()
-      out_err_num = out_tree().num_leaves - len(out_val_axes)
-      return (*(0,)*out_err_num, *out_val_axes)
+# class CheckifyTrace(core.Trace):
+#   pure = lift = lambda self, val: CheckifyTracer(self, val)
 
-    params_ = dict(params, in_axes=(*(None,)*num_error_vals, *params['in_axes']),
-                   out_axes_thunk=new_out_axes_thunk,
-                   donated_invars=(*(False,)*num_error_vals, *params['donated_invars']))
-    all_vals = primitive.bind(f, *flat_vals, **params_)
-    error, *out_vals = tree_unflatten(out_tree(), all_vals)
-    error = _reduce_any_error(error)
-    setnewattr(self.main, 'error', error)
-    return [CheckifyTracer(self, x) for x in out_vals]
+#   def __init__(self, main: core.MainTrace, sublevel: core.Sublevel,
+#                enabled_errors: FrozenSet['ErrorCategory']) -> None:
+#     self.main = main
+#     self.level = main.level
+#     self.sublevel = sublevel
+#     self.main.enabled_errors = enabled_errors
 
-  def post_process_call(self, primitive, tracers, params):
-    vals = [t.val for t in tracers]
-    main = self.main
-    e = popattr(main, 'error')
-    err_leaves, err_tree = tree_flatten(e)
-    setnewattr(main, 'err_tree', err_tree)
-    def todo(vals):
-      err_tree = popattr(main, 'err_tree')
-      err_vals, vals = split_list(vals, [err_tree.num_leaves])
-      setnewattr(main, 'error', tree_unflatten(err_tree, err_vals))
-      trace = main.with_cur_sublevel()
-      return [CheckifyTracer(trace, x) for x in vals]
-    return (*err_leaves, *vals), todo
+#   def sublift(self, tracer):
+#     return CheckifyTracer(self, tracer.val)
 
-  def post_process_map(self, primitive, tracers, params):
-    vals = [t.val for t in tracers]
-    main = self.main
-    e = popattr(main, 'error')
-    err_leaves, err_tree = tree_flatten(e)
-    num_err_leaves = len(err_leaves)
-    setnewattr(main, 'err_tree', err_tree)
-    def todo(vals):
-      err_tree = popattr(main, 'err_tree')
-      err_vals, vals = split_list(vals, [err_tree.num_leaves])
-      error = tree_unflatten(err_tree, err_vals)
-      error = _reduce_any_error(error)
-      setnewattr(main, 'error', error)
-      trace = main.with_cur_sublevel()
-      return [CheckifyTracer(trace, x) for x in vals]
-    def out_axes_transform(out_axes):
-      return (*(0,)*num_err_leaves, *out_axes)
-    return (*err_leaves, *vals), (todo, out_axes_transform)
+#   def process_primitive(self, primitive, tracers, params):
+#     in_vals = [t.val for t in tracers]
+#     rule = error_checks.get(primitive)
+#     if rule:
+#       out, self.main.error = rule(self.main.error, self.main.enabled_errors,  # type: ignore
+#                                   *in_vals, **params)
+#     else:
+#       out = primitive.bind(*in_vals, **params)
+#     if primitive.multiple_results:
+#       return [CheckifyTracer(self, x) for x in out]
+#     else:
+#       return CheckifyTracer(self, out)
 
-  def process_custom_jvp_call(self, prim, f, jvp, tracers):
-    in_vals = [t.val for t in tracers]
-    e = popattr(self.main, 'error')
-    err_vals, err_tree = tree_flatten(e)
-    flat_vals, in_tree = tree_flatten((e, *in_vals))
-    num_error_vals = len(err_vals)
-    f = checkify_subtrace(f, self.main)
-    f, f_out_tree = flatten_fun_nokwargs(f, in_tree)
-    jvp, jvp_err_tree = checkify_custom_jvp_subtrace(jvp, self.main,
-                                                     num_error_vals, err_tree)
-    all_outs = prim.bind(f, jvp, *flat_vals)
-    fst, out_tree = lu.merge_linear_aux(f_out_tree, jvp_err_tree)
-    if fst:
-      out_err, *out_vals = tree_unflatten(out_tree, all_outs)
-    else:
-      err_vals, out_vals = split_list(all_outs, [num_error_vals])
-      # forward input error values to output
-      out_err = tree_unflatten(out_tree, err_vals)
-    setattr(self.main, 'error', out_err)
-    return [CheckifyTracer(self, x) for x in out_vals]
+#   def process_call(self, primitive, f, tracers, params):
+#     in_vals = [t.val for t in tracers]
+#     e = popattr(self.main, 'error')
+#     flat_vals, in_tree = tree_flatten((e, *in_vals))
+#     f = checkify_subtrace(f, self.main)
+#     f, out_tree = flatten_fun_nokwargs(f, in_tree)
+#     if 'donated_invars' in params:
+#       params = dict(params, donated_invars=(*[False]*len(jtu.tree_leaves(e)),
+#                                             *params['donated_invars']))
+#     all_vals = primitive.bind(f, *flat_vals, **params)
+#     error, *out_vals = tree_unflatten(out_tree(), all_vals)
+#     setnewattr(self.main, 'error', error)
+#     return [CheckifyTracer(self, x) for x in out_vals]
 
-  def post_process_custom_jvp_call(self, tracers, jvp_was_run):
-    if jvp_was_run:
-      msg = ('support for custom_jvp rules which close over checkify values is '
-             'not implemented. If you see this, open an issue at '
-             'https://github.com/google/jax/issues!')
-      raise NotImplementedError(msg)
-    vals = [t.val for t in tracers]
-    main = self.main
-    e = popattr(main, 'error')
-    err_leaves, err_tree = tree_flatten(e)
-    def todo(vals):
-      err_vals, vals = split_list(vals, [len(err_leaves)])
-      setnewattr(main, 'error', tree_unflatten(err_tree, err_vals))
-      trace = main.with_cur_sublevel()
-      return [CheckifyTracer(trace, x) for x in vals]
-    return (*err_leaves, *vals), todo
+#   def process_map(self, primitive, f, tracers, params):
+#     in_vals = [t.val for t in tracers]
+#     e = popattr(self.main, 'error')
+#     flat_vals, in_tree = tree_flatten((e, *in_vals))
+#     num_error_vals = len(jtu.tree_leaves(e))
+#     f = checkify_subtrace(f, self.main)
+#     f, out_tree = flatten_fun_nokwargs(f, in_tree)
 
-  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees):
-    in_vals = [t.val for t in tracers]
-    e = popattr(self.main, 'error')
-    err_vals, err_tree = tree_flatten(e)
-    flat_vals, in_tree = tree_flatten((e, *in_vals))
-    num_error_vals = len(err_vals)
+#     @as_hashable_function(closure=params['out_axes_thunk'])
+#     def new_out_axes_thunk():
+#       out_val_axes = params['out_axes_thunk']()
+#       out_err_num = out_tree().num_leaves - len(out_val_axes)
+#       return (*(0,)*out_err_num, *out_val_axes)
 
-    fun = checkify_subtrace(fun, self.main)
-    fun, fun_out_tree = flatten_fun_nokwargs(fun, in_tree)
-    fwd, fwd_err_tree = checkify_custom_vjp_subtrace(fwd, self.main,
-                                                     err_tree, num_error_vals)
+#     params_ = dict(params, in_axes=(*(None,)*num_error_vals, *params['in_axes']),
+#                    out_axes_thunk=new_out_axes_thunk,
+#                    donated_invars=(*(False,)*num_error_vals, *params['donated_invars']))
+#     all_vals = primitive.bind(f, *flat_vals, **params_)
+#     error, *out_vals = tree_unflatten(out_tree(), all_vals)
+#     error = _reduce_any_error(error)
+#     setnewattr(self.main, 'error', error)
+#     return [CheckifyTracer(self, x) for x in out_vals]
 
-    all_out_vals = prim.bind(fun, fwd, bwd, *flat_vals, out_trees=out_trees)
-    fst, out_tree = lu.merge_linear_aux(fun_out_tree, fwd_err_tree)
-    if fst:
-      error, *out = tree_unflatten(out_tree, all_out_vals)
-    else:
-      _, out = split_list(all_out_vals, [num_error_vals])
-      # forward input error values to output
-      error = tree_unflatten(err_tree, err_vals)
-    setattr(self.main, 'error', error)
-    return [CheckifyTracer(self, x) for x in out]
+#   def post_process_call(self, primitive, tracers, params):
+#     vals = [t.val for t in tracers]
+#     main = self.main
+#     e = popattr(main, 'error')
+#     err_leaves, err_tree = tree_flatten(e)
+#     setnewattr(main, 'err_tree', err_tree)
+#     def todo(vals):
+#       err_tree = popattr(main, 'err_tree')
+#       err_vals, vals = split_list(vals, [err_tree.num_leaves])
+#       setnewattr(main, 'error', tree_unflatten(err_tree, err_vals))
+#       trace = main.with_cur_sublevel()
+#       return [CheckifyTracer(trace, x) for x in vals]
+#     return (*err_leaves, *vals), todo
+
+#   def post_process_map(self, primitive, tracers, params):
+#     vals = [t.val for t in tracers]
+#     main = self.main
+#     e = popattr(main, 'error')
+#     err_leaves, err_tree = tree_flatten(e)
+#     num_err_leaves = len(err_leaves)
+#     setnewattr(main, 'err_tree', err_tree)
+#     def todo(vals):
+#       err_tree = popattr(main, 'err_tree')
+#       err_vals, vals = split_list(vals, [err_tree.num_leaves])
+#       error = tree_unflatten(err_tree, err_vals)
+#       error = _reduce_any_error(error)
+#       setnewattr(main, 'error', error)
+#       trace = main.with_cur_sublevel()
+#       return [CheckifyTracer(trace, x) for x in vals]
+#     def out_axes_transform(out_axes):
+#       return (*(0,)*num_err_leaves, *out_axes)
+#     return (*err_leaves, *vals), (todo, out_axes_transform)
+
+#   def process_custom_jvp_call(self, prim, f, jvp, tracers):
+#     in_vals = [t.val for t in tracers]
+#     e = popattr(self.main, 'error')
+#     err_vals, err_tree = tree_flatten(e)
+#     flat_vals, in_tree = tree_flatten((e, *in_vals))
+#     num_error_vals = len(err_vals)
+#     f = checkify_subtrace(f, self.main)
+#     f, f_out_tree = flatten_fun_nokwargs(f, in_tree)
+#     jvp, jvp_err_tree = checkify_custom_jvp_subtrace(jvp, self.main,
+#                                                      num_error_vals, err_tree)
+#     all_outs = prim.bind(f, jvp, *flat_vals)
+#     fst, out_tree = lu.merge_linear_aux(f_out_tree, jvp_err_tree)
+#     if fst:
+#       out_err, *out_vals = tree_unflatten(out_tree, all_outs)
+#     else:
+#       err_vals, out_vals = split_list(all_outs, [num_error_vals])
+#       # forward input error values to output
+#       out_err = tree_unflatten(out_tree, err_vals)
+#     setattr(self.main, 'error', out_err)
+#     return [CheckifyTracer(self, x) for x in out_vals]
+
+#   def post_process_custom_jvp_call(self, tracers, jvp_was_run):
+#     if jvp_was_run:
+#       msg = ('support for custom_jvp rules which close over checkify values is '
+#              'not implemented. If you see this, open an issue at '
+#              'https://github.com/google/jax/issues!')
+#       raise NotImplementedError(msg)
+#     vals = [t.val for t in tracers]
+#     main = self.main
+#     e = popattr(main, 'error')
+#     err_leaves, err_tree = tree_flatten(e)
+#     def todo(vals):
+#       err_vals, vals = split_list(vals, [len(err_leaves)])
+#       setnewattr(main, 'error', tree_unflatten(err_tree, err_vals))
+#       trace = main.with_cur_sublevel()
+#       return [CheckifyTracer(trace, x) for x in vals]
+#     return (*err_leaves, *vals), todo
+
+#   def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees):
+#     in_vals = [t.val for t in tracers]
+#     e = popattr(self.main, 'error')
+#     err_vals, err_tree = tree_flatten(e)
+#     flat_vals, in_tree = tree_flatten((e, *in_vals))
+#     num_error_vals = len(err_vals)
+
+#     fun = checkify_subtrace(fun, self.main)
+#     fun, fun_out_tree = flatten_fun_nokwargs(fun, in_tree)
+#     fwd, fwd_err_tree = checkify_custom_vjp_subtrace(fwd, self.main,
+#                                                      err_tree, num_error_vals)
+
+#     all_out_vals = prim.bind(fun, fwd, bwd, *flat_vals, out_trees=out_trees)
+#     fst, out_tree = lu.merge_linear_aux(fun_out_tree, fwd_err_tree)
+#     if fst:
+#       error, *out = tree_unflatten(out_tree, all_out_vals)
+#     else:
+#       _, out = split_list(all_out_vals, [num_error_vals])
+#       # forward input error values to output
+#       error = tree_unflatten(err_tree, err_vals)
+#     setattr(self.main, 'error', error)
+#     return [CheckifyTracer(self, x) for x in out]
 
 def _reduce_any_error(error: Error):
   out_error = init_error
@@ -506,95 +617,67 @@ def _reduce_any_error(error: Error):
 ErrorCheckRule = Callable  # (Error, FrozenSet[ErrorCategory], *in_vals, **params) -> (Any, Error)
 error_checks: Dict[core.Primitive, ErrorCheckRule] = {}
 
-def checkify_flat(fun: lu.WrappedFun, enabled_errors: FrozenSet['ErrorCategory'],
-                  *args):
-  fun = checkify_subtrace(fun)
-  fun = checkify_traceable(fun, enabled_errors)
-  error, *outvals = fun.call_wrapped(init_error, *args)
-  return error, outvals
+# def checkify_flat(fun: lu.WrappedFun, enabled_errors: FrozenSet['ErrorCategory'],
+#                   *args):
+#   fun = checkify_subtrace(fun)
+#   fun = checkify_traceable(fun, enabled_errors)
+#   error, *outvals = fun.call_wrapped(init_error, *args)
+#   return error, outvals
 
-@lu.transformation
-def checkify_traceable(enabled_errors, error, *args):
-  with core.new_main(CheckifyTrace, enabled_errors=enabled_errors) as main:
-    outs = yield (main, error, *args), {}
-    del main
-  yield outs
+# @lu.transformation
+# def checkify_traceable(enabled_errors, error, *args):
+#   with core.new_main(CheckifyTrace, enabled_errors=enabled_errors) as main:
+#     outs = yield (main, error, *args), {}
+#     del main
+#   yield outs
 
-@lu.transformation
-def checkify_subtrace(main, error, *args):
-  setnewattr(main, 'error', error)
-  trace = main.with_cur_sublevel()
-  in_tracers = [CheckifyTracer(trace, x) for x in args]
-  out = yield in_tracers, {}
-  out_tracers = map(trace.full_raise, out)
-  out_vals = [t.val for t in out_tracers]
-  error = main.error
-  del main.error
-  yield (error, *out_vals)
+# @lu.transformation
+# def checkify_subtrace(main, error, *args):
+#   setnewattr(main, 'error', error)
+#   trace = main.with_cur_sublevel()
+#   in_tracers = [CheckifyTracer(trace, x) for x in args]
+#   out = yield in_tracers, {}
+#   out_tracers = map(trace.full_raise, out)
+#   out_vals = [t.val for t in out_tracers]
+#   error = main.error
+#   del main.error
+#   yield (error, *out_vals)
 
-@lu.transformation_with_aux
-def checkify_custom_jvp_subtrace(main, num_error_vals, out_tree, *args):
-  # Like checkify_subtrace, but used specifically on the custom JVP rules
-  # associated with a custom_jvp. This code is called in the context of a
-  # jvp-of-checkify-of-custom_jvp. It takes both primal and tangent inputs,
-  # flattened into a single args tuple, and similarly must produce flattened
-  # primal and tangent outputs. Both primals and tangents include error values,
-  # but the tangent error values are trivially zero.
-  # The types to have in mind are:
-  #   jvp : (a -> b) -> (a, T a) -> (b, T b)
-  #   checkify : (a -> b) -> a -> Err b
-  #   jvp-of-checkify : (a -> b) -> (a, T a) -> (Err b, T (Err b))
-  # where because Err is a pytree, we necessarily have T (Err b) = Err' (T b)
-  # where the other Err' components are trivial (of float0 dtype).
-  # Semantically, we don't add checks to the JVP rule. To check the result of a
-  # JVP rule, one must instead use checkify-of-jvp. Thus this implementation
-  # just forwards the input error and code (and trivial tangents) to the output.
-  del main
-  n, ragged = divmod(len(args), 2)
-  assert not ragged
-  err_primals, primals = split_list(args[:n], [num_error_vals])
-  err_tangents, tangents = split_list(args[n:], [num_error_vals])
-  outs = yield (*primals, *tangents), {}
-  m, ragged = divmod(len(outs), 2)
-  assert not ragged
-  out_primals, out_tangents = outs[:m], outs[m:]
-  yield (*err_primals, *out_primals, *err_tangents, *out_tangents), out_tree
+# @lu.transformation_with_aux
+# def checkify_custom_jvp_subtrace(main, num_error_vals, out_tree, *args):
+#   # Like checkify_subtrace, but used specifically on the custom JVP rules
+#   # associated with a custom_jvp. This code is called in the context of a
+#   # jvp-of-checkify-of-custom_jvp. It takes both primal and tangent inputs,
+#   # flattened into a single args tuple, and similarly must produce flattened
+#   # primal and tangent outputs. Both primals and tangents include error values,
+#   # but the tangent error values are trivially zero.
+#   # The types to have in mind are:
+#   #   jvp : (a -> b) -> (a, T a) -> (b, T b)
+#   #   checkify : (a -> b) -> a -> Err b
+#   #   jvp-of-checkify : (a -> b) -> (a, T a) -> (Err b, T (Err b))
+#   # where because Err is a pytree, we necessarily have T (Err b) = Err' (T b)
+#   # where the other Err' components are trivial (of float0 dtype).
+#   # Semantically, we don't add checks to the JVP rule. To check the result of a
+#   # JVP rule, one must instead use checkify-of-jvp. Thus this implementation
+#   # just forwards the input error and code (and trivial tangents) to the output.
+#   del main
+#   n, ragged = divmod(len(args), 2)
+#   assert not ragged
+#   err_primals, primals = split_list(args[:n], [num_error_vals])
+#   err_tangents, tangents = split_list(args[n:], [num_error_vals])
+#   outs = yield (*primals, *tangents), {}
+#   m, ragged = divmod(len(outs), 2)
+#   assert not ragged
+#   out_primals, out_tangents = outs[:m], outs[m:]
+#   yield (*err_primals, *out_primals, *err_tangents, *out_tangents), out_tree
 
-@lu.transformation_with_aux
-def checkify_custom_vjp_subtrace(main, err_tree, num_error_vals, *args):
-  del main
-  # We don't add any checks; just drop input error values.
-  _, args = split_list(args, [num_error_vals])
-  outs = yield args, {}
-  yield outs, err_tree
-
-@lu.transformation_with_aux
-def query_error_effects(*args):
-  (error, *outs) = yield args, {}
-  yield (error, *outs), set(error._pred.keys())
-
-def checkify_jaxpr(jaxpr, error,
-                   enabled_errors) -> Tuple[core.ClosedJaxpr,
-                                            Tuple[PyTreeDef,
-                                                  FrozenSet[ErrorEffect]]]:
-  f = lu.wrap_init(core.jaxpr_as_fun(jaxpr))
-  return checkify_fun_to_jaxpr(f, error, enabled_errors, jaxpr.in_avals)
-
-def checkify_fun_to_jaxpr(
-    f, error, enabled_errors,
-    in_avals) -> Tuple[core.ClosedJaxpr, Tuple[PyTreeDef, FrozenSet[ErrorEffect]]]:
-  flat_error_vals, in_tree = tree_flatten(error)
-  f = checkify_subtrace(f)
-  f = checkify_traceable(f, enabled_errors)
-  f, error_effect = query_error_effects(f)
-  in_tree = jtu.tree_structure((error, *in_avals))
-  f, out_tree = flatten_fun_nokwargs(f, in_tree)
-  err_vals = map(lambda x: core.raise_to_shaped(core.get_aval(x)),
-                 flat_error_vals)
-  avals_in = [*err_vals, *in_avals]
-  jaxpr_out, _, literals_out = pe.trace_to_jaxpr_dynamic(f, avals_in)
-  return (core.ClosedJaxpr(jaxpr_out, literals_out), (out_tree(), error_effect()))
-
+# @lu.transformation_with_aux
+# def checkify_custom_vjp_subtrace(main, err_tree, num_error_vals, *args):
+#   del main
+#   # We don't add any checks; just drop input error values.
+#   _, args = split_list(args, [num_error_vals])
+#   outs = yield args, {}
+#   yield outs, err_tree
 
 
 def check(pred: Bool, msg: str, *fmt_args, **fmt_kwargs) -> None:
@@ -997,27 +1080,28 @@ error_checks[lax.scatter_min_p] = functools.partial(scatter_error_check,
 error_checks[lax.scatter_max_p] = functools.partial(scatter_error_check,
                                                     lax.scatter_max_p)
 
-def cond_error_check(error, enabled_errors, index, *ops, branches, linear):
-  _, out_trees_and_effects = unzip2(checkify_jaxpr(jxpr, error,
-                                                   enabled_errors)
-                                    for jxpr in branches)
-  _, effects = unzip2(out_trees_and_effects)
-
+def cond_error_check(error: Error, enabled_errors, index, *ops, branches, linear):
+  # Get the error-effects out of all branches so the cond can be called with
+  # a merged error with all these effects.
+  effects = [get_error_effects_from_jaxpr(jxpr, enabled_errors, error, *ops)
+             for jxpr in branches]
   merged_error = error._add_placeholder_effects(set().union(*effects))
-  new_branches, out_trees_and_effects = unzip2(checkify_jaxpr(jxpr, merged_error,
-                                                              enabled_errors)
-                                               for jxpr in branches)
-  out_trees, _ = unzip2(out_trees_and_effects)
 
-  flat_error, _ = tree_flatten(merged_error)
-  new_linear = (*[False] * len(flat_error), *linear)
+  checked_branch_funs = tuple(
+      functools.partial(checkify_jaxpr_flat, closed_jaxpr.jaxpr, closed_jaxpr.consts, enabled_errors)
+      for closed_jaxpr in branches)
+  in_vals, in_tree = jtu.tree_flatten((error, ops))
+  get_shaped_aval = lambda x: core.raise_to_shaped(core.get_aval(x))
+  in_avals = tuple(map(get_shaped_aval, in_vals))
+  # TODO: we need a fun to jaxpr here but don't know which one.
+
+  err_vals, err_tree = jtu.tree_flatten(merged_error)
+  new_linear = (*[False] * len(err_vals), *linear)
   err_and_outs = lax.cond_p.bind(
-      index, *flat_error, *ops,
+      index, *ops,
       branches=tuple(new_branches), linear=new_linear)
 
   # we need to merge metadata across out_trees (a tuple)
-  # maybe there's a better way to do this, but we can use the outs
-  # to unflatten all trees.
   err0, *out = tree_unflatten(out_trees[0], err_and_outs)
   merged_metadata = err0._metadata
   for tr in out_trees[1:]:
@@ -1199,41 +1283,6 @@ float_checks = nan_checks | div_checks
 automatic_checks = float_checks | index_checks
 all_checks = automatic_checks | user_checks
 
-Out = TypeVar('Out')
-
-def checkify_initial_jaxpr(enabled_errors, jaxpr: core.Jaxpr,
-                           consts: Sequence[core.Value],
-                           *args: core.Value) -> Tuple[Out, Error]:
-  env = {}
-  error = init_error
-
-  def read_env(var: core.Var):
-    if isinstance(var, core.Literal):
-      return var.val
-    return env[var]
-
-  def write_env(var, val):
-    env[var] = val
-  map(write_env, jaxpr.constvars, consts)
-  map(write_env, jaxpr.invars, args)
-
-  # interpreter loop
-  for eqn in jaxpr.eqns:
-    invals = map(read_env, eqn.invars)
-    checkify_rule = error_checks.get(eqn.primitive)
-    if checkify_rule:
-      outvals, error = checkify_rule(error, enabled_errors,
-                                     *invals, **eqn.params)
-    else:
-      outvals = eqn.primitive.bind(*invals, **eqn.params)
-
-    if eqn.primitive.multiple_results:
-      map(write_env, eqn.outvars, outvals)
-    else:
-      write_env(eqn.outvars[0], outvals)
-
-  return map(read_env, jaxpr.outvars), error
-
 
 def checkify(f: Callable[..., Out],
              errors: FrozenSet[ErrorCategory] = user_checks
@@ -1251,7 +1300,7 @@ def checkify(f: Callable[..., Out],
     out_tree = out_tree()
     # checkify:
     flat_args = jtu.tree_leaves((args, kwargs))
-    out_flat, error = checkify_initial_jaxpr(errors, closed_jaxpr.jaxpr,
-                                             closed_jaxpr.consts, *flat_args)
+    out_flat, error = checkify_jaxpr(core.ClosedJaxpr(jaxpr, consts), errors,
+                                     init_error, *flat_args)
     return error, jtu.tree_unflatten(out_tree, out_flat)
   return checked_fun

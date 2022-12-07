@@ -35,7 +35,7 @@ import jax.numpy as jnp
 config.parse_flags_with_absl()
 
 
-@jtu.with_config(jax_check_tracer_leaks=True)
+# @jtu.with_config(jax_check_tracer_leaks=True)
 class CheckifyTransformTests(jtu.JaxTestCase):
 
   @jtu.sample_product(jit=[False, True])

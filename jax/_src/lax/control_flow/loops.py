@@ -966,7 +966,11 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts, num_carry
   if not all(_map(core.typecompat, x_avals_jaxpr, x_avals_mapped)):
     raise core.JaxprTypeError(
       f'scan jaxpr takes input sequence types\n{_avals_short(x_avals_jaxpr)},\n'
+<<<<<<< HEAD
       f'called with sequence whose items have type\n{_avals_short(x_avals_mapped)}')
+=======
+      f'called with sequence of type\n{_avals_short(x_avals_mapped)}')
+>>>>>>> dfb17908c (Fixed all but custom_jvp/vjp!)
   return [*init_avals, *y_avals], jaxpr.effects
 
 def _scan_pp_rule(eqn, context, settings):

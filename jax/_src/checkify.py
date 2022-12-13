@@ -25,6 +25,7 @@ from jax import linear_util as lu
 from jax._src import prng
 from jax._src import source_info_util
 from jax._src import traceback_util
+from jax._src import custom_derivatives
 from jax._src.config import config
 from jax._src.lax import control_flow as cf
 from jax._src.sharding import OpShardingSharding
@@ -357,16 +358,20 @@ def default_checkify_rule(primitive: core.Primitive, error: Error,
     # Default primitive case: call primitive and don't update error.
     return error, primitive.bind(*invals, **params)
 
-  call_jaxpr = params.pop('call_jaxpr')
   err_vals, err_tree = jtu.tree_flatten(error)
   num_error_vals = len(err_vals)
+  if 'donated_invars' in params:
+    params = dict(params, donated_invars=(*[False]*num_error_vals,
+                                          *params['donated_invars']))
+
+  # call_jaxpr handling
+  call_jaxpr = params.pop('call_jaxpr')
   partial_checkify = lu.wrap_init(
       functools.partial(checkify_jaxpr_flat, call_jaxpr, (), enabled_errors))
   partial_checkify, metadata = _flatten_and_get_error_metadata_thunk(
       partial_checkify, err_tree)
-  if 'donated_invars' in params:
-    params = dict(params, donated_invars=(*[False]*num_error_vals,
-                                          *params['donated_invars']))
+
+  # map/jvp/vjp-specific param transformation.
   if isinstance(primitive, core.MapPrimitive):
     # Update `in_axes` and `out_axes_thunk` params for map primitive.
     out_val_axes = params.pop('out_axes')
@@ -427,67 +432,79 @@ def checkify_jaxpr_flat(jaxpr: core.Jaxpr, consts: Sequence[core.Value],
 
   return error, map(read_env, jaxpr.outvars)
 
-#   def process_custom_jvp_call(self, prim, f, jvp, tracers):
-#     in_vals = [t.val for t in tracers]
+@lu.transformation_with_aux
+def flatten_fun_output(*args):
+  ans = yield args, {}
+  yield tree_flatten(ans)
 
-#     e = popattr(self.main, 'error')
-#     err_vals, err_tree = tree_flatten(e)
-#     flat_vals, in_tree = tree_flatten((e, *in_vals))
-#     num_error_vals = len(err_vals)
-#     f = checkify_subtrace(f, self.main)
-#     f, f_out_tree = flatten_fun_nokwargs(f, in_tree)
-#     jvp, jvp_err_tree = checkify_custom_jvp_subtrace(jvp, self.main,
-#                                                      num_error_vals, err_tree)
-#     all_outs = prim.bind(f, jvp, *flat_vals)
-#     fst, out_tree = lu.merge_linear_aux(f_out_tree, jvp_err_tree)
-#     if fst:
-#       out_err, *out_vals = tree_unflatten(out_tree, all_outs)
-#     else:
-#       err_vals, out_vals = split_list(all_outs, [num_error_vals])
-#       # forward input error values to output
-#       out_err = tree_unflatten(out_tree, err_vals)
-#     setattr(self.main, 'error', out_err)
-#     return [CheckifyTracer(self, x) for x in out_vals]
+def custom_jvp_call_rule(in_err, enabled_errors, *in_vals, num_consts,
+                         jvp_jaxpr_thunk, call_jaxpr, **params):
+  # The types to have in mind are:
+  #   jvp : (a -> b) -> (a, T a) -> (b, T b)
+  #   checkify : (a -> b) -> a -> Err b
+  #   jvp-of-checkify : (a -> b) -> (a, T a) -> (Err b, T (Err b))
+  # where because Err is a pytree, we necessarily have T (Err b) = Err' (T b)
+  # where the other Err' components are trivial (of float0 dtype).
+  # Semantically, we don't add checks to the JVP rule. To check the result of a
+  # JVP rule, one must instead use checkify-of-jvp. Thus this implementation
+  # just forwards the input error and code (and trivial tangents) to the output.
+  err_vals, err_tree = jtu.tree_flatten(in_err)
+  partial_checkify = lu.wrap_init(
+      functools.partial(checkify_jaxpr_flat, call_jaxpr.jaxpr,
+                        call_jaxpr.consts, enabled_errors, err_tree))
+  partial_checkify, f_metadata = _flatten_and_get_error_metadata_thunk(
+      partial_checkify)
 
-#   def post_process_custom_jvp_call(self, tracers, jvp_was_run):
-#     if jvp_was_run:
-#       msg = ('support for custom_jvp rules which close over checkify values is '
-#              'not implemented. If you see this, open an issue at '
-#              'https://github.com/google/jax/issues!')
-#       raise NotImplementedError(msg)
-#     vals = [t.val for t in tracers]
-#     main = self.main
-#     e = popattr(main, 'error')
-#     err_leaves, err_tree = tree_flatten(e)
-#     def todo(vals):
-#       err_vals, vals = split_list(vals, [len(err_leaves)])
-#       setnewattr(main, 'error', tree_unflatten(err_tree, err_vals))
-#       trace = main.with_cur_sublevel()
-#       return [CheckifyTracer(trace, x) for x in vals]
-#     return (*err_leaves, *vals), todo
+  # Construct the defaul jvp function, without checkify-ing.
+  @lu.wrap_init
+  def jvp(*xs):
+    # TODO(lenamartens, sharadmv): why not checkify here?
+    jvp_jaxpr, jvp_consts = jvp_jaxpr_thunk()
+    n, ragged = divmod(len(xs), 2)
+    assert not ragged
+    primals, tangents = xs[num_consts:n], xs[n+num_consts:]
+    return core.eval_jaxpr(jvp_jaxpr, jvp_consts, *primals, *tangents)
 
-#   def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees):
-#     in_vals = [t.val for t in tracers]
-#     e = popattr(self.main, 'error')
-#     err_vals, err_tree = tree_flatten(e)
-#     flat_vals, in_tree = tree_flatten((e, *in_vals))
-#     num_error_vals = len(err_vals)
+  jvp, jvp_out_tree = flatten_fun_output(jvp)
+  all_outs = custom_derivatives.custom_jvp_call_p.bind(partial_checkify, jvp,
+                                                       *err_vals, *in_vals)
+  fst, out_metadata = lu.merge_linear_aux(f_metadata, jvp_out_tree)
+  if fst:
+    err_and_out_tree, _ = out_metadata
+    out_err, out_vals = tree_unflatten(err_and_out_tree, all_outs)
+  else:
+    err_vals, out_vals = split_list(all_outs, [len(err_vals)])
+    # forward input error to output
+    out_err = jtu.tree_unflatten(err_tree, err_vals)
+  return out_err, out_vals
 
-#     fun = checkify_subtrace(fun, self.main)
-#     fun, fun_out_tree = flatten_fun_nokwargs(fun, in_tree)
-#     fwd, fwd_err_tree = checkify_custom_vjp_subtrace(fwd, self.main,
-#                                                      err_tree, num_error_vals)
+def custom_vjp_call_jaxpr_rule(in_err, enabled_errors, *in_vals, fun_jaxpr,
+                               fwd_jaxpr_thunk, num_consts, bwd, out_trees):
+  err_vals, err_tree = jtu.tree_flatten(in_err)
+  fun = lu.wrap_init(
+      functools.partial(checkify_jaxpr_flat, fun_jaxpr.jaxpr,
+                        fun_jaxpr.consts, enabled_errors, err_tree))
+  fun, fun_metadata = _flatten_and_get_error_metadata_thunk(fun)
 
-#     all_out_vals = prim.bind(fun, fwd, bwd, *flat_vals, out_trees=out_trees)
-#     fst, out_tree = lu.merge_linear_aux(fun_out_tree, fwd_err_tree)
-#     if fst:
-#       error, *out = tree_unflatten(out_tree, all_out_vals)
-#     else:
-#       _, out = split_list(all_out_vals, [num_error_vals])
-#       # forward input error values to output
-#       error = tree_unflatten(err_tree, err_vals)
-#     setattr(self.main, 'error', error)
-#     return [CheckifyTracer(self, x) for x in out]
+  @lu.wrap_init
+  def fwd(*xs):
+    # TODO(lenamartens, sharadmv): why not checkify here?
+    fwd_jaxpr, fwd_consts = fwd_jaxpr_thunk()
+    xs_without_consts = xs[num_consts:]
+    return core.eval_jaxpr(fwd_jaxpr, fwd_consts, *xs_without_consts)
+
+  fwd, fwd_out_tree = flatten_fun_output(fwd)
+  all_outs = custom_derivatives.custom_vjp_call_p.bind(
+      fun, fwd, bwd, *err_vals, *in_vals, out_trees=out_trees)
+  fst, out_metadata = lu.merge_linear_aux(fun_metadata, fwd_out_tree)
+  if fst:
+    err_and_out_tree, _ = out_metadata
+    out_err, out_vals = tree_unflatten(err_and_out_tree, all_outs)
+  else:
+    err_vals, out_vals = split_list(all_outs, [len(err_vals)])
+    # forward input error to output
+    out_err = jtu.tree_unflatten(err_tree, err_vals)
+  return out_err, out_vals
 
 def _reduce_any_error(error: Error):
   out_error = init_error
@@ -505,6 +522,8 @@ def _reduce_any_error(error: Error):
 
 ErrorCheckRule = Callable  # (Error, FrozenSet[ErrorCategory], *in_vals, **params) -> (Any, Error)
 error_checks: Dict[core.Primitive, ErrorCheckRule] = {}
+error_checks[custom_derivatives.custom_jvp_call_p] = custom_jvp_call_rule
+error_checks[custom_derivatives.custom_vjp_call_jaxpr_p] = custom_vjp_call_jaxpr_rule
 
 # def checkify_flat(fun: lu.WrappedFun, enabled_errors: FrozenSet['ErrorCategory'],
 #                   *args):
@@ -869,8 +888,8 @@ nan_primitives = [lax.acos_p, lax.acosh_p, lax.add_p, lax.asin_p, lax.asinh_p,
                   lax.rem_p, lax.rng_uniform_p, lax.rsqrt_p, lax.sin_p,
                   lax.sinh_p, lax.sqrt_p, lax.sub_p, lax.tan_p, lax.tanh_p]
 
-for prim in nan_primitives:
-  error_checks[prim] = functools.partial(nan_error_check, prim)
+for _prim in nan_primitives:
+  error_checks[_prim] = functools.partial(nan_error_check, _prim)
 
 
 def gather_error_check(error, enabled_errors, operand, start_indices, *,
@@ -1221,6 +1240,62 @@ all_checks = automatic_checks | user_checks
 def checkify(f: Callable[..., Out],
              errors: FrozenSet[ErrorCategory] = user_checks
              ) -> Callable[..., Tuple[Error, Out]]:
+  """Functionalize `check` calls in `fun`, and optionally add run-time error checks.
+
+  Run-time errors are either user-added :func:`~check` assertions, or
+  automatically added checks like NaN checks, depending on the ``errors``
+  argument.
+
+  The returned function will return an Error object `err` along with the output
+  of the original function. ``err.get()`` will either return ``None`` (if no
+  error occurred) or a string containing an error message. This error message
+  will correspond to the first error which occurred. ``err.throw()`` will raise
+  a ValueError with the error message if an error occurred.
+
+  By default only user-added :func:`~check` assertions are enabled. You can
+  enable automatic checks through the ``errors`` argument.
+
+  The automatic check sets which can be enabled, and when an error is generated:
+    - ``user_checks``: a :func:`~check` evaluated to False.
+    - ``nan_checks``: a floating-point operation generated a NaN value
+      as output.
+    - ``div_checks``: a division by zero.
+    - ``index_checks``: an index was out-of-bounds.
+
+  Multiple categories can be enabled together by passing in an error `Set` (eg.
+  ``errors=nan_checks``). Multiple sets can be re-combined (eg.
+  ``errors=float_checks|user_checks``)
+
+  Args:
+    fun: Callable which can contain user checks (see :func:`~check`).
+    errors: A set of ErrorCategory values which defines the set of enabled
+      checks. By default only explicit ``checks`` are enabled
+      (``user_checks``). You can also for example enable NAN and
+      DIV errors by passing the ``float_checks`` set, or for
+      example combine multiple sets through set operations
+      (``float_checks | user_checks``)
+  Returns:
+    A function which accepts the same arguments as ``fun`` and returns as output
+    a pair where the first element is an ``Error`` value, representing the first
+    failed :func:`~check`, and the second element is the original output of
+    ``fun``.
+
+  For example:
+
+    >>> import jax
+    >>> import jax.numpy as jnp
+    >>> from jax.experimental import checkify
+    >>>
+    >>> @jax.jit
+    ... def f(x):
+    ...   y = jnp.sin(x)
+    ...   return x+y
+    >>> err, out = checkify.checkify(f, errors=checkify.float_checks)(jnp.inf)
+    >>> err.throw()  # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+      ...
+    jax._src.checkify.JaxRuntimeError: nan generated by primitive: sin
+  """
   @traceback_util.api_boundary
   def checked_fun(*args, **kwargs):
     # stage:

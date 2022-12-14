@@ -352,7 +352,7 @@ def get_error_effects_from_jaxpr(closed_jaxpr: core.ClosedJaxpr,
 
 def default_checkify_rule(primitive: core.Primitive, error: Error,
                           enabled_errors, *invals: core.Value,
-                          **params: Any) -> Tuple[Sequence[core.Value], Error]:
+                          **params: Any) -> Tuple[Error, Sequence[core.Value]]:
   """Default rule for primitives in `checkify` interpreter."""
   if 'call_jaxpr' not in params:
     # Default primitive case: call primitive and don't update error.
@@ -402,17 +402,17 @@ def checkify_jaxpr(jaxpr: core.ClosedJaxpr, enabled_errors,
 
 def checkify_jaxpr_flat(jaxpr: core.Jaxpr, consts: Sequence[core.Value],
                         enabled_errors, err_tree: PyTreeDef,
-                        *args: core.Value) -> Tuple[Out, Error]:
-  env = {}
+                        *args: core.Value) -> Tuple[Error, List[Any]]:
+  env: Dict[core.Var, Any] = {}
   err_vals, args = split_list(args, [err_tree.num_leaves])
   error = jtu.tree_unflatten(err_tree, err_vals)
 
-  def read_env(var: core.Var):
+  def read_env(var: core.Atom):
     if isinstance(var, core.Literal):
       return var.val
     return env[var]
 
-  def write_env(var, val):
+  def write_env(var: core.Var, val: Any):
     assert not isinstance(val, Sequence)
     assert not isinstance(val, Error)
     env[var] = val
@@ -1072,8 +1072,8 @@ def checkify_while_body_jaxpr(
     # This checks if the next cond application will error
     _ = cond_f(*c_consts, *out)
     return out
-  new_body_f = lu.wrap_init(new_body_f)
-  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(new_body_f, body_jaxpr.in_avals)
+  new_body_f_ = lu.wrap_init(new_body_f)
+  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(new_body_f_, body_jaxpr.in_avals)
   closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
   err_vals, err_tree = jtu.tree_flatten(error)
   err_vals = map(get_shaped_aval, err_vals)
@@ -1137,12 +1137,12 @@ def jaxpr_to_checkify_jaxpr(jaxpr: core.ClosedJaxpr, enabled_errors,
   checkify_jaxpr_partial = functools.partial(checkify_jaxpr_flat, jaxpr.jaxpr,
                                              jaxpr.consts, enabled_errors,
                                              err_tree)
-  checkify_jaxpr_partial = lu.wrap_init(checkify_jaxpr_partial)
+  checkify_jaxpr_partial_ = lu.wrap_init(checkify_jaxpr_partial)
 
-  checkify_jaxpr_partial, metadata = _flatten_and_get_error_metadata_thunk(
-      checkify_jaxpr_partial)
+  checkify_jaxpr_partial_, metadata = _flatten_and_get_error_metadata_thunk(
+      checkify_jaxpr_partial_)
 
-  new_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(checkify_jaxpr_partial,
+  new_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(checkify_jaxpr_partial_,
                                                    flat_err_and_in_vals)
   checked_jaxpr = core.ClosedJaxpr(new_jaxpr, consts)
   if with_effects:

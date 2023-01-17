@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 from functools import partial
 
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -28,11 +28,27 @@ from jax._src.util import safe_map, safe_zip, split_list
 
 from jax._src.state.types import ShapedArrayRef
 from jax._src.state.primitives import get_p, swap_p, addupdate_p
+from jax._src.state import util as state_util
 
 ## JAX utilities
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
+
+## `run_state`
+
+# `run_state` is the main function by which we discharge state effects from JAX
+# function. It is responsible for creating `Ref`s from an initial set of values
+# and returns the final values in those `Ref`s. Its signature is as follows:
+# ```
+# run_state :: (Ref a -> () {State (Ref a)}) -> a -> a
+# ```
+
+def run_state(f_stateful: Callable[..., None], *args: Any):
+  pass
+
+run_state_p = core.Primitive("run_state")
+run_state_p.multiple_results = True
 
 ## Discharging state
 

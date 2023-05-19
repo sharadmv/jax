@@ -870,6 +870,7 @@ if CAN_USE_HYPOTHESIS:
     @hp.given(set_vmap_params())
     @hp.settings(deadline=None, print_blob=True,
                  max_examples=config.FLAGS.jax_num_generated_cases)
+    @hp.reproduce_failure('6.75.3', b'AXicY2ZkAEImBhDJwoABGDGFIOIAAwkAEQ==')
     def test_set_vmap(self, set_vmap_param: SetVmapParams):
 
       indexed_dims = set_vmap_param.vmap_index_param.index_param.indexed_dims
@@ -899,9 +900,9 @@ if CAN_USE_HYPOTHESIS:
       discharge_of_vmap_ans = core.eval_jaxpr(jaxpr, consts, ref, val, *non_slice_idx)
 
       # vmap-of-discharge
-      stateful_jaxpr, _, stateful_consts = pe.trace_to_jaxpr_dynamic(
+      stateful_jaxpr2, _, stateful_consts = pe.trace_to_jaxpr_dynamic(
           lu.wrap_init(f), [ref_aval, val_aval, *idx_avals])
-      jaxpr_, consts_ = discharge_state(stateful_jaxpr, stateful_consts)
+      jaxpr_, consts_ = discharge_state(stateful_jaxpr2, stateful_consts)
       f_batched = jax.vmap(partial(core.eval_jaxpr, jaxpr_, consts_),
                            in_axes=(ref_bdim, val_bdim, *idx_bdims),
                            out_axes=[ref_bdim])
@@ -959,13 +960,14 @@ class StateControlFlowTest(jtu.JaxTestCase):
 
   def test_simple_cond(self):
     def f(pred):
+      @run_state
       def body(x_ref):
         def true_fun():
           x_ref[()] = 1.
         def false_fun():
           pass
         lax.cond(pred, true_fun, false_fun)
-      return for_loop.run_state(body, 0.)
+      return body(0.)
     jaxpr = jax.make_jaxpr(f)(True).jaxpr
     self.assertEmpty(jaxpr.effects)
     self.assertAllClose(jax.jit(f)(True), 1.)
@@ -973,6 +975,7 @@ class StateControlFlowTest(jtu.JaxTestCase):
 
   def test_nested_cond(self):
     def f(pred):
+      @run_state
       def body(x_ref):
         def true_fun():
           def true_fun_inner():
@@ -983,7 +986,7 @@ class StateControlFlowTest(jtu.JaxTestCase):
         def false_fun():
           pass
         lax.cond(pred, true_fun, false_fun)
-      return for_loop.run_state(body, 0.)
+      return body(0.)
     jaxpr = jax.make_jaxpr(f)(True).jaxpr
     self.assertEmpty(jaxpr.effects)
     self.assertAllClose(jax.jit(f)(True), 1.)
@@ -991,13 +994,14 @@ class StateControlFlowTest(jtu.JaxTestCase):
 
   def test_cond_jvp_with_state(self):
     def f(pred, init_value):
+      @run_state
       def body(x_ref):
         def true_fun():
           x_ref[()] = x_ref[()] ** 2
         def false_fun():
           pass
         lax.cond(pred, true_fun, false_fun)
-      return for_loop.run_state(body, init_value)
+      return body(init_value)
 
     out_primal, out_tangent = jax.jvp(partial(f, True), (3.,), (1.,))
     self.assertAllClose(out_primal, 9.)
@@ -1010,13 +1014,14 @@ class StateControlFlowTest(jtu.JaxTestCase):
   def test_cond_vmap_not_implemented(self):
     @jax.jit
     def f(init_value):
+      @run_state
       def body(x_ref):
         def true_fun():
           x_ref[()] = x_ref[()] ** 2
         def false_fun():
           pass
         lax.cond(x_ref[()] < 1, true_fun, false_fun)
-      return for_loop.run_state(body, init_value)
+      return body(init_value)
 
     with self.assertRaises(NotImplementedError):
       jax.vmap(f)(jnp.arange(2.))
@@ -1024,16 +1029,50 @@ class StateControlFlowTest(jtu.JaxTestCase):
   def test_cond_grad_not_implemented(self):
     @jax.jit
     def f(init_value):
+      @run_state
       def body(x_ref):
         def true_fun():
           x_ref[()] = x_ref[()] ** 2
         def false_fun():
           pass
         lax.cond(True, true_fun, false_fun)
-      return for_loop.run_state(body, init_value)
+      return body(init_value)
 
     with self.assertRaises(NotImplementedError):
       jax.grad(f)(3.)
+
+  def test_while_with_state_in_body(self):
+    def f(x, y, z):
+      @run_state
+      def body(x_ref):
+        def cond(i):
+          return i < y
+        def body(i):
+          x_ref[...] += z
+          return i + 1
+        lax.while_loop(cond, body, 0)
+      return body(x)
+    jaxpr = jax.make_jaxpr(f)(0, 5, 2).jaxpr
+    self.assertEmpty(jaxpr.effects)
+    self.assertAllClose(jax.jit(f)(0, 5, 2), 10)
+    self.assertAllClose(jax.jit(f)(1, 2, 3), 7)
+
+  def test_scan_with_state_in_body(self):
+    def f(x, w, y, zs):
+      @run_state
+      def body(refs):
+        x_ref, w_ref = refs
+        def body(y, z):
+          x_ref[...] += y
+          w_ref[...] += z
+          return y + 1, ()
+        lax.scan(body, y, zs)
+      return body((x, w))
+    zs = jnp.arange(5)
+    jaxpr = jax.make_jaxpr(f)(0, 1, 5, zs).jaxpr
+    self.assertEmpty(jaxpr.effects)
+    self.assertAllClose(jax.jit(f)(0, 1, 5, zs), (35, 11))
+    self.assertAllClose(jax.jit(f)(1, 1, 2, zs), (21, 11))
 
 class GeneralRefTest(jtu.JaxTestCase):
 

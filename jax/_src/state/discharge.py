@@ -31,6 +31,7 @@ from jax._src import source_info_util
 from jax._src import tree_util
 from jax._src.config import config
 from jax._src.interpreters import ad
+from jax._src.interpreters import mlir
 from jax._src.lax import lax
 from jax._src.lax import slicing as lax_slicing
 from jax._src.state.types import AbstractRef, RefEffect
@@ -274,6 +275,7 @@ def _run_state_impl(*args: Any, jaxpr: core.Jaxpr,
   discharged_jaxpr, consts = discharge_state(jaxpr, ())
   return core.eval_jaxpr(discharged_jaxpr, consts, *args)
 run_state_p.def_impl(_run_state_impl)
+mlir.register_lowering(run_state_p, mlir.lower_fun(_run_state_impl))
 
 def _run_state_abstract_eval(*avals: core.AbstractValue, jaxpr: core.Jaxpr,
                              which_linear: tuple[bool, ...]):
@@ -379,7 +381,7 @@ def _run_state_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
   discharged_jaxpr = pe.convert_constvars_jaxpr(discharged_jaxpr_)
   for _ in range(num_inputs):
     jaxpr_in_unknowns = [False] * len(discharged_consts) + in_unknowns
-    _, _, out_unknowns, out_inst, _, _ = pe.partial_eval_jaxpr_stateful(
+    _, _, out_unknowns, out_inst, _, _, _ = pe.partial_eval_jaxpr_stateful(
         discharged_jaxpr, jaxpr_in_unknowns, jaxpr_in_unknowns,
           in_unknowns, False, _save_everything)
     # assert out_inst == out_unknowns
@@ -392,10 +394,9 @@ def _run_state_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
   del out_unknowns  # redundant since it's the same as `in_unknowns`
   tracers = tuple(trace.instantiate_const(t) if uk else t  # type: ignore
                   for t, uk in zip(tracers, in_unknowns))
-
   # We use `partial_eval_jaxpr_stateful` here because it won't remove effectful
   # primitives like `get`/`set`.
-  jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res_out, num_res_ref = \
+  jaxpr_known_resout, jaxpr_unknown_resin_, _, _, new_in_inst, num_res_out, num_res_ref = \
         pe.partial_eval_jaxpr_stateful(jaxpr, in_unknowns, in_inst=in_unknowns,
                                      ensure_out_unknowns=[], ensure_out_inst=[],
                                      saveable=_save_everything)
@@ -439,8 +440,12 @@ def _run_state_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
   # into `Ref`s.
   jaxpr_unknown = _convert_inputs_to_reads(len(new_res_avals),
                                            jaxpr_unknown_resin_)
-  _, unknown_tracers = partition_list(in_unknowns, tracers)
-  _, uk_which_linear = partition_list(in_unknowns, which_linear)
+  inst_and_known = [not uk and inst for uk, inst in zip(in_unknowns,
+                                                        new_in_inst)]
+  tracers = [trace.instantiate_const(t) if i_and_k else t for t, i_and_k
+             in zip(tracers, inst_and_known)]
+  _, unknown_tracers = partition_list(new_in_inst, tracers)
+  _, uk_which_linear = partition_list(new_in_inst, which_linear)
   unknown_which_linear = (False,) * num_res + tuple(uk_which_linear)
   unknown_inputs = [*nonref_res, *ref_res, *unknown_tracers]
   # Outputs match inputs so we construct output tracers that look like the input
@@ -460,7 +465,9 @@ def _run_state_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
                           run_state_p, uk_params,
                           eqn_effects, source)
   for t in res_ref_unknown_outputs: t.recipe = eqn
-  _, unknown_outputs = split_list(res_ref_unknown_outputs, [num_res])
+  inst_and_known = [uk for uk, inst in zip(in_unknowns, new_in_inst) if inst]
+  _, inst_unknown_outputs = split_list(res_ref_unknown_outputs, [num_res])
+  _, unknown_outputs = partition_list(inst_and_known, inst_unknown_outputs)
   return merge_lists(in_unknowns, known_outputs, unknown_outputs)
 pe.custom_partial_eval_rules[run_state_p] = _run_state_partial_eval
 
@@ -486,7 +493,7 @@ def _run_state_partial_eval_custom(
   out_unknowns, out_inst =  in_unknowns, in_unknowns
   for _ in range(num_inputs):
     jaxpr_in_unknowns = [False] * len(discharged_consts) + in_unknowns
-    _, _, out_unknowns, out_inst, _, _ = pe.partial_eval_jaxpr_stateful(
+    _, _, out_unknowns, out_inst, _, _, _ = pe.partial_eval_jaxpr_stateful(
         discharged_jaxpr,
         in_unknowns=jaxpr_in_unknowns,
         in_inst=jaxpr_in_unknowns,
@@ -500,14 +507,14 @@ def _run_state_partial_eval_custom(
   else:
     if num_inputs > 0: raise Exception("Invalid fixpoint")
   del out_unknowns # Redundant since it's the same as `in_unknowns`
-  new_inst = [x for x, already, inst in zip(eqn.invars, in_inst, out_inst)
-              if type(x) is core.Var and inst and not already]
 
   # We use `partial_eval_jaxpr_stateful` here because it won't remove effectful
   # primitives like `get`/`set`.
-  jaxpr_known_resout, jaxpr_staged_resin_, _, _, num_res_out, num_res_ref = \
+  jaxpr_known_resout, jaxpr_staged_resin_, _, _, new_in_inst, num_res_out, num_res_ref = \
         pe.partial_eval_jaxpr_stateful(jaxpr, in_unknowns,
             in_unknowns, [], [], saveable)
+  new_inst = [x for x, already, inst in zip(eqn.invars, in_inst, new_in_inst)
+              if type(x) is core.Var and inst and not already]
   num_res = num_res_ref + num_res_out
   # `partial_eval_jaxpr_stateful` will give us jaxprs that have hybrid `Ref` and
   # non-Ref input/outputs. However, we'd like to bind these jaxprs to a
@@ -547,15 +554,15 @@ def _run_state_partial_eval_custom(
 
   jaxpr_staged = _convert_inputs_to_reads(len(res_avals), jaxpr_staged_resin_)
 
-  _, staged_which_linear = partition_list(in_unknowns, which_linear)
+  _, staged_which_linear = partition_list(new_in_inst, which_linear)
   which_linear_unknown = (*[False] * num_res, *staged_which_linear)
   staged_params = dict(jaxpr=jaxpr_staged, which_linear=which_linear_unknown)
   rejiggered_resvars = [*nonref_resvars, *ref_resvars]
-  _, staged_invars = partition_list(in_unknowns, eqn.invars)
+  _, staged_invars = partition_list(new_in_inst, eqn.invars)
   res_staged_invars = [*rejiggered_resvars, *staged_invars]
   _, staged_effects = run_state_p.abstract_eval(
       *[v.aval for v in res_staged_invars], **staged_params)
-  _, staged_outvars = partition_list(in_unknowns, eqn.outvars)
+  _, staged_outvars = partition_list(new_in_inst, eqn.outvars)
   if num_res:
     @lu.wrap_init
     def staged(*args):
@@ -563,6 +570,7 @@ def _run_state_partial_eval_custom(
       return out[num_res:]
     staged_call_jaxpr, _, () = pe.trace_to_jaxpr_dynamic(staged,
         [v.aval for v in res_staged_invars])
+    core.check_jaxpr(staged_call_jaxpr)
     eqn_staged = pe.new_jaxpr_eqn(res_staged_invars,
                                   staged_outvars,
                                   core.closed_call_p,
@@ -576,8 +584,10 @@ def _run_state_partial_eval_custom(
                                   run_state_p,
                                   staged_params,
                                   staged_effects, eqn.source_info)
+    assert len(staged_invars) == len(staged_params["jaxpr"].invars)
+    assert len(staged_outvars) == len(staged_params["jaxpr"].invars)
   new_vars = [*new_inst, *nonref_resvars, *ref_resvars]
-  return eqn_known, eqn_staged, in_unknowns, in_unknowns, new_vars
+  return eqn_known, eqn_staged, in_unknowns, new_in_inst, new_vars
 pe.partial_eval_jaxpr_custom_rules[run_state_p] = _run_state_partial_eval_custom
 
 def _transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: Sequence[bool]
@@ -585,12 +595,11 @@ def _transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: Sequence[bool]
   def trans(*args):
     # First we want to run the computation to read all the residual refs. We can
     # do that by using partial evaluation with all linear inputs unknown.
-    res_jaxpr_, tangent_jaxpr_, *_, num_res_out, num_res_ref = \
+    res_jaxpr_, tangent_jaxpr_, *_, new_in_inst, num_res_out, num_res_ref = \
         pe.partial_eval_jaxpr_stateful(jaxpr, which_linear, in_inst=which_linear,
                                        ensure_out_inst=[],
                                        ensure_out_unknowns=[],
                                        saveable=_save_everything)
-
     num_unknown = sum(which_linear)
     num_known = len(jaxpr.invars) - num_unknown
     res_args, _ = partition_list(which_linear, args)
@@ -615,7 +624,7 @@ def _transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: Sequence[bool]
     _, nonref_res = partition_list(used_nonref_res, nonref_res_)
     _, ref_res = partition_list(used_ref_res, ref_res_)
     primals_args = [*nonref_res, *ref_res]
-    _, tangent_args = partition_list(which_linear, args)
+    _, tangent_args = partition_list(new_in_inst, args)
     _, ct_args = partition_list(used_cts, tangent_args)
     ad.backward_pass(
         tangent_jaxpr, (), False, (), (*primals_args, *ct_args), ())

@@ -2811,7 +2811,7 @@ def _check_jaxpr(
           if jaxpr_effect not in jaxpr.effects:
             raise JaxprTypeError(
                 "Invalid `JaxprInputEffect`: must be present in jaxpr. "
-                f"{jaxpr_effect} is not in {jaxpr.effects}.")
+                f"{jaxpr_effect} is not in {jaxpr.effects}. {eqn}")
         elif eff not in jaxpr.effects:
           raise JaxprTypeError("Equation effect not present in jaxpr effects. "
                                f"Equation effect: {eff}. "

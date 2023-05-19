@@ -219,6 +219,7 @@ def _swap_abstract_eval(ref_aval: AbstractRef,
       raise ValueError("Invalid shape for `swap`. "
                        f"Ref shape: {ref_aval.shape}. "
                        f"Value shape: {val_aval.shape}. "
+                       f"Expected output shape: {expected_output_shape}. "
                        f"Indices: {idx}. ")
     if ref_aval.dtype != val_aval.dtype:
       raise ValueError("Invalid dtype for `swap`. "

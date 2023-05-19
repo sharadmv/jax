@@ -558,9 +558,11 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
 
   # We use `partial_eval_jaxpr_custom` here because it won't remove effectful
   # primitives like `get`/`set`.
-  jaxpr_known_resout, jaxpr_staged_resin_, _, _, num_res = \
-        pe.partial_eval_jaxpr_custom(jaxpr, [False, *in_unknowns],
+  jaxpr_known_resout, jaxpr_staged_resin_, _, _, new_in_inst, num_res, num_res_ref = \
+        pe.partial_eval_jaxpr_stateful(jaxpr, [False, *in_unknowns],
             [True, *in_inst], [], [], saveable)
+  if new_in_inst != tuple((True, *in_inst)): raise NotImplementedError
+  if num_res_ref: raise NotImplementedError
 
   # `partial_eval_jaxpr_custom` will give us jaxprs that have hybrid `Ref` and
   # non-Ref input/outputs. However, we'd like to bind these jaxprs to a
@@ -588,21 +590,24 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
 
   known_invars, _ = partition_list(in_unknowns, eqn.invars)
   known_outvars, _ = partition_list(in_unknowns, eqn.outvars)
+
+  # In a stateful partial_eval, the residuals should be `Ref`s.
+  res_avals = map(AbstractRef, res_avals)  # type: ignore
   newvar = core.gensym()
   resvars = map(newvar, res_avals)
+  known_out_resvars = map(newvar, res_avals)
 
   @lu.wrap_init
-  def known(*known_vals):
-    empty_res = map(ad_util.zeros_like_aval, res_avals)
-    jaxpr_known_args = [*known_vals, *empty_res]
-    jaxpr_known_which_linear = (False,) * len(jaxpr_known_args)
-    return for_p.bind(*jaxpr_known_args, jaxpr=jaxpr_known, nsteps=nsteps,
+  def known(*known_vals_and_res):
+    jaxpr_known_which_linear = (False,) * len(known_vals_and_res)
+    return for_p.bind(*known_vals_and_res, jaxpr=jaxpr_known, nsteps=nsteps,
                       reverse=reverse, which_linear=jaxpr_known_which_linear,
                       unroll=unroll)
   call_jaxpr_, _, call_jaxpr_consts = pe.trace_to_jaxpr_dynamic(
-      known, [v.aval for v in known_invars])
+      known, [v.aval for v in known_invars] + res_avals)
   call_jaxpr = core.ClosedJaxpr(call_jaxpr_, call_jaxpr_consts)
-  eqn_known = pe.new_jaxpr_eqn(known_invars, [*known_outvars, *resvars],
+  eqn_known = pe.new_jaxpr_eqn([*known_invars, *resvars], [*known_outvars,
+                                                           *known_out_resvars],
                                core.closed_call_p, dict(call_jaxpr=call_jaxpr),
                                call_jaxpr.effects, eqn.source_info)
 
@@ -623,6 +628,7 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
     return ans
   call_jaxpr_, _, call_jaxpr_consts = pe.trace_to_jaxpr_dynamic(
       staged, [v.aval for v in [*resvars, *eqn.invars]])
+  core.check_jaxpr(call_jaxpr_)
   assert len(jaxpr_staged.invars) - 1 == len(call_jaxpr_.invars)
   call_jaxpr = core.ClosedJaxpr(call_jaxpr_, call_jaxpr_consts)
   _, outvars = partition_list(out_inst, eqn.outvars)

@@ -491,7 +491,14 @@ def _scan_abstract_eval(*args, reverse, length, num_consts, num_carry, jaxpr,
                         linear, unroll):
   carry_avals, y_avals = split_list(jaxpr.out_avals, [num_carry])
   ys_avals = _map(partial(_prepend_dim_to_aval, length), y_avals)
-  return carry_avals + ys_avals, jaxpr.effects
+  nonlocal_effects = set()
+  for eff in jaxpr.effects:
+    breakpoint()
+    if False:#isinstance(eff, effects.JaxprInputEffect):
+      nonlocal_effects.add(eff.replace(input_index=eff.input_index - num_consts))
+    else:
+      nonlocal_effects.add(eff)
+  return carry_avals + ys_avals, nonlocal_effects
 
 def _scan_jvp(primals, tangents, reverse, length, jaxpr, num_consts, num_carry,
               linear, unroll):

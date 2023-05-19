@@ -379,7 +379,7 @@ def _run_state_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
   discharged_jaxpr = pe.convert_constvars_jaxpr(discharged_jaxpr_)
   for _ in range(num_inputs):
     jaxpr_in_unknowns = [False] * len(discharged_consts) + in_unknowns
-    _, _, out_unknowns, out_inst, _, _ = pe.partial_eval_jaxpr_stateful(
+    _, _, out_unknowns, out_inst, _, _, _ = pe.partial_eval_jaxpr_stateful(
         discharged_jaxpr, jaxpr_in_unknowns, jaxpr_in_unknowns,
           in_unknowns, False, _save_everything)
     # assert out_inst == out_unknowns
@@ -395,10 +395,12 @@ def _run_state_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
 
   # We use `partial_eval_jaxpr_stateful` here because it won't remove effectful
   # primitives like `get`/`set`.
-  jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res_out, num_res_ref = \
+  jaxpr_known_resout, jaxpr_unknown_resin_, _, _, new_in_inst, num_res_out, num_res_ref = \
         pe.partial_eval_jaxpr_stateful(jaxpr, in_unknowns, in_inst=in_unknowns,
                                      ensure_out_unknowns=[], ensure_out_inst=[],
                                      saveable=_save_everything)
+  if new_in_inst != in_unknowns:
+    raise NotImplementedError
   # # `partial_eval_jaxpr_stateful` will give us jaxprs that have hybrid `Ref`
   # and regular valued input/outputs. However, we'd like to bind these jaxprs to
   # a `for`, which expects only `Ref` inputs and no output. We need to convert
@@ -486,7 +488,7 @@ def _run_state_partial_eval_custom(
   out_unknowns, out_inst =  in_unknowns, in_unknowns
   for _ in range(num_inputs):
     jaxpr_in_unknowns = [False] * len(discharged_consts) + in_unknowns
-    _, _, out_unknowns, out_inst, _, _ = pe.partial_eval_jaxpr_stateful(
+    _, _, out_unknowns, out_inst, _, _, _ = pe.partial_eval_jaxpr_stateful(
         discharged_jaxpr,
         in_unknowns=jaxpr_in_unknowns,
         in_inst=jaxpr_in_unknowns,
@@ -505,9 +507,11 @@ def _run_state_partial_eval_custom(
 
   # We use `partial_eval_jaxpr_stateful` here because it won't remove effectful
   # primitives like `get`/`set`.
-  jaxpr_known_resout, jaxpr_staged_resin_, _, _, num_res_out, num_res_ref = \
+  jaxpr_known_resout, jaxpr_staged_resin_, _, _, new_in_inst, num_res_out, num_res_ref = \
         pe.partial_eval_jaxpr_stateful(jaxpr, in_unknowns,
             in_unknowns, [], [], saveable)
+  if new_in_inst != in_unknowns:
+    raise NotImplementedError
   num_res = num_res_ref + num_res_out
   # `partial_eval_jaxpr_stateful` will give us jaxprs that have hybrid `Ref` and
   # non-Ref input/outputs. However, we'd like to bind these jaxprs to a
@@ -585,12 +589,13 @@ def _transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: Sequence[bool]
   def trans(*args):
     # First we want to run the computation to read all the residual refs. We can
     # do that by using partial evaluation with all linear inputs unknown.
-    res_jaxpr_, tangent_jaxpr_, *_, num_res_out, num_res_ref = \
+    res_jaxpr_, tangent_jaxpr_, *_, new_in_inst, num_res_out, num_res_ref = \
         pe.partial_eval_jaxpr_stateful(jaxpr, which_linear, in_inst=which_linear,
                                        ensure_out_inst=[],
                                        ensure_out_unknowns=[],
                                        saveable=_save_everything)
-
+    if new_in_inst != which_linear:
+      raise NotImplementedError
     num_unknown = sum(which_linear)
     num_known = len(jaxpr.invars) - num_unknown
     res_args, _ = partition_list(which_linear, args)

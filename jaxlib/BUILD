@@ -64,7 +64,7 @@ py_library_providing_imports_info(
         "//jaxlib/mlir:pass_manager",
         "//jaxlib/mlir:sparse_tensor_dialect",
         "//jaxlib/mlir:stablehlo_dialect",
-        # placeholder for osaic target
+        "//jaxlib/mosaic"
     ],
 )
 

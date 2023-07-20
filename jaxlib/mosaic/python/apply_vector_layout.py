@@ -28,12 +28,12 @@ import math
 import re
 from typing import Any, Callable, Literal, Sequence, Union, overload
 
-from mlir import ir
-from mlir.dialects import arith
-from mlir.dialects import func
-from mlir.dialects import math as math_dialect
-from mlir.dialects import scf
-from mlir.dialects import vector
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import func
+from jaxlib.mlir.dialects import math as math_dialect
+from jaxlib.mlir.dialects import scf
+from jaxlib.mlir.dialects import vector
 import numpy as np
 
 from . import infer_memref_layout

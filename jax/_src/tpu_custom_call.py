@@ -27,9 +27,9 @@ import jax
 from jax import core
 from jax.interpreters import mlir
 from jax.interpreters import xla
-from mlir import ir
-from mlir.dialects import stablehlo
-from mlir.passmanager import PassManager
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import stablehlo
+from jaxlib.mlir.passmanager import PassManager
 from jax._src.lib import tpu_mosaic
 import numpy as np
 
